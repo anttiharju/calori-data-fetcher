@@ -1,10 +1,10 @@
 [project]
 name = "calori-data-fetcher"
-version = "0.2.0"
+version = "0.3.0"
 description = "Export selected Calori meals as weekly YAML files."
 readme = "README.md"
-requires-python = ">=3.15"
-dependencies = ["networkx", "ruamel-yaml"]
+requires-python = ">=3.14,<3.15"
+dependencies = ["pulp[highs]>=4,<5", "ruamel-yaml"]
 
 [dependency-groups]
 dev = ["pyyaml", "ruff", "ty", "types-pyyaml"]
@@ -14,14 +14,14 @@ package = false
 required-version = ">=0.13.0"
 
 [tool.ruff]
-target-version = "py315"
+target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
 extend-select = ["I", "UP"]
 
 [tool.ty.environment]
-python-version = "3.15"
+python-version = "3.14"
 
 [tool.ty.src]
 include = ["calori.py", "test_calori.py"]

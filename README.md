@@ -2,7 +2,7 @@
 
 Export your selected Calori meals and available choices as weekly YAML files.
 The command also counts meals from earlier exports.
-The `select` command plans unique, uneaten meals for the latest exported week.
+The `select` command plans meals near a daily calorie target for the latest exported week.
 The command uses the same API as the web dashboard.
 
 ## Requirements
@@ -18,9 +18,9 @@ From this repository directory, run:
 uv sync --locked
 ```
 
-uv installs Python 3.15.0 from [.python-version](.python-version) and creates a local virtual environment.
-The project requires Python 3.15 or newer. ruamel.yaml writes the YAML files and their date comments.
-NetworkX matches distinct meals to available slots.
+uv installs Python 3.14 from [.python-version](.python-version) and creates a local virtual environment.
+The project requires Python 3.14. PuLP 4 and its HiGHS solver have prebuilt macOS wheels for this version.
+ruamel.yaml writes the YAML files and their date comments.
 Ruff, ty, PyYAML, and the PyYAML type stubs are development dependencies. [uv.lock](uv.lock) pins the dependency versions.
 
 ## Sign In
@@ -86,16 +86,23 @@ It then rebuilds the meal statistics from the stored weekly files.
 Each file replacement is atomic. Files for other weeks remain unchanged.
 A file-system error can leave some weeks updated and others unchanged. A failed command returns a nonzero exit code.
 
-## Select Uneaten Meals
+## Select Meals
 
-To preview a plan for the latest exported week, run:
+To preview a plan near 2,500 calories per day for the latest exported week, run:
 
 ```sh
 uv run calori.py select
 ```
 
-The preview shows the proposed meal names and slots as YAML on stdout.
+The preview shows meal names, slots, calories, and historical eaten counts as YAML on stdout.
+It also shows the calorie total for each day.
 It does not change your selections or meal exports.
+
+For a different daily calorie target, run:
+
+```sh
+uv run calori.py select --calories 2400
+```
 
 To save the plan to Calori, run:
 
@@ -106,11 +113,24 @@ uv run calori.py select --apply
 The `--apply` option changes your selections on Calori. Each run builds a fresh plan from the live API menu.
 The command uses the same historical selections as the meal statistics, with the newest stored week excluded.
 It reads those weekly exports directly, so a stale statistics file does not affect the plan.
-Only meals absent from that history qualify as uneaten.
+Previously eaten meals remain eligible.
 
-Every existing slot receives a different meal name. The command preserves each slot's meal size and does not add slots.
+The planner uses PuLP 4 and HiGHS to optimize the whole week together.
+Each meal name can appear only once in the week, even across different portion sizes.
+The planner applies these priorities in order:
+
+1. Smallest sum of absolute daily differences from the calorie target.
+2. Smallest difference for the day furthest from the target.
+3. Lowest total historical eaten count for the week.
+
+Meal names and variant IDs define stable weights for remaining ties.
+The command preserves each slot's meal size and does not add slots.
+Calories come from the actual meal variants, not template nutrition. Exact daily totals are not always possible.
 Defaults remain eligible, regardless of the website chooser filters.
-If no full plan exists, the command stops without changes. It does not repeat meals or use previously eaten meals as substitutes.
+
+If the week has no full plan with unique meals, the command stops without changes.
+Each optimization stage has a 30-second limit. The command stops if the solver cannot prove an optimal result within that limit.
+Missing or invalid calorie values also cause an error.
 Closed weeks and weeks in the past cause an error.
 
 Before the first update, the command compares your live selections with the original plan data.
@@ -233,4 +253,4 @@ uv run ruff format .
 ```
 
 [pyproject.toml](pyproject.toml) contains the project, Ruff, and ty configuration.
-Both checkers target Python 3.15.
+Both checkers target Python 3.14.

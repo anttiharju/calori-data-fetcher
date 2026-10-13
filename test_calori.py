@@ -73,6 +73,7 @@ class FakeClient:
         self.week_closed = False
         self.selections = None
         self.patches = []
+        self.meals = []
         self.templates = [{"id": "test-template", "name": "Test meal"}]
         self.availability = [
             {
@@ -100,9 +101,17 @@ class FakeClient:
             )
         if path == "/rest/v1/sub_meal_selections":
             return meal_rows() if self.selections is None else copy.deepcopy(self.selections)
-        if path in ("/rest/v1/meal_templates", "/rest/v1/consumption_slots_mixed"):
+        if path in (
+            "/rest/v1/meal_templates",
+            "/rest/v1/consumption_slots_mixed",
+            "/rest/v1/meals",
+        ):
             assert params is not None
-            rows = self.templates if path.endswith("meal_templates") else self.availability
+            rows = {
+                "/rest/v1/meal_templates": self.templates,
+                "/rest/v1/consumption_slots_mixed": self.availability,
+                "/rest/v1/meals": self.meals,
+            }[path]
             offset = int(params["offset"])
             return rows[offset : offset + int(params["limit"])]
         raise AssertionError("Unexpected request: " + path)
@@ -123,7 +132,8 @@ class FakeClient:
                     for template in self.templates
                     if body["meal_id"] in (template.get("small_id"), template.get("large_id"))
                 )
-                row["meals"] = {"id": body["meal_id"], "meal_templates": template}
+                variant = next(meal for meal in self.meals if meal["id"] == body["meal_id"])
+                row["meals"] = {**variant, "meal_templates": template}
                 return [{"id": row["id"], "meal_id": row["meal_id"]}]
         return []
 
@@ -391,55 +401,149 @@ class AvailabilityTests(unittest.TestCase):
             calori.export_meal_opportunities(self.client, self.monday, 1)
 
 
-class PlanningTests(unittest.TestCase):
+class CaloriePlanningTests(unittest.TestCase):
     def setUp(self):
-        self.opportunities: list[calori.MealOpportunity] = [
-            {
-                "name": "Apple Delight",
-                "opportunities": 2,
-                "spots": ["mon/breakfast", "mon/snack"],
-            },
-            {
-                "name": "Banana Quark",
-                "opportunities": 2,
-                "spots": ["mon/breakfast", "tue/breakfast"],
-            },
-            {"name": "Previous meal", "opportunities": 1, "spots": ["mon/snack"]},
-        ]
-        self.slots = [("mon", "breakfast"), ("mon", "snack")]
+        self.options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "breakfast"): [
+                {"name": "Small breakfast", "meal_id": "small", "calories": 600},
+                {"name": "Big breakfast", "meal_id": "big", "calories": 800},
+            ],
+            ("mon", "lunch"): [
+                {"name": "Light lunch", "meal_id": "light", "calories": 1500},
+                {"name": "Hearty lunch", "meal_id": "hearty", "calories": 1900},
+            ],
+        }
 
-    def test_finds_a_complete_plan_without_repeats_or_previously_eaten_meals(self):
-        original = copy.deepcopy(self.opportunities)
-        plan = calori.plan_unique_meals(self.opportunities, {"Previous meal"}, self.slots)
-        self.assertEqual(
-            plan, {("mon", "breakfast"): "Banana Quark", ("mon", "snack"): "Apple Delight"}
+    def test_finds_the_closest_total_before_preferring_less_eaten_meals(self):
+        original = copy.deepcopy(self.options)
+        plan = calori.plan_calorie_meals(
+            self.options, calori.Counter({"Small breakfast": 5, "Hearty lunch": 3})
         )
-        self.assertEqual(self.opportunities, original)
-
-    def test_plan_does_not_depend_on_input_order(self):
-        expected = calori.plan_unique_meals(self.opportunities, set(), self.slots)
         self.assertEqual(
-            calori.plan_unique_meals(
-                list(reversed(self.opportunities)), set(), list(reversed(self.slots))
+            [meal["name"] for meal in plan.values()], ["Small breakfast", "Hearty lunch"]
+        )
+        self.assertEqual(sum(meal["calories"] for meal in plan.values()), 2500)
+        self.assertEqual(self.options, original)
+
+    def test_equal_calorie_totals_prefer_lower_historical_counts(self):
+        self.options["mon", "lunch"][0]["calories"] = 1700
+        plan = calori.plan_calorie_meals(
+            self.options, calori.Counter({"Small breakfast": 5, "Light lunch": 1})
+        )
+        self.assertEqual([meal["name"] for meal in plan.values()], ["Big breakfast", "Light lunch"])
+
+    def test_calorie_deviation_uses_both_sides_of_the_target_and_decimal_values(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "lunch"): [
+                {"name": "Above", "meal_id": "above", "calories": 2500.2},
+                {"name": "Below", "meal_id": "below", "calories": 2499.6},
+            ]
+        }
+        plan = calori.plan_calorie_meals(options, calori.Counter())
+        self.assertEqual(plan["mon", "lunch"]["name"], "Above")
+
+    def test_same_name_cannot_repeat_within_a_day_even_for_different_variants(self):
+        self.options["mon", "breakfast"][0]["name"] = "Same meal"
+        self.options["mon", "lunch"][1]["name"] = "Same meal"
+        plan = calori.plan_calorie_meals(self.options, calori.Counter())
+        self.assertEqual(len({meal["name"] for meal in plan.values()}), 2)
+        self.assertNotEqual(sum(meal["calories"] for meal in plan.values()), 2500)
+
+    def test_meals_cannot_repeat_across_days(self):
+        first: calori.MealChoice = {"name": "First", "meal_id": "first", "calories": 2500}
+        second: calori.MealChoice = {"name": "Second", "meal_id": "second", "calories": 2500}
+        options = {("mon", "lunch"): [first], ("tue", "lunch"): [first, second]}
+        plan = calori.plan_calorie_meals(options, calori.Counter())
+        self.assertEqual([meal["name"] for meal in plan.values()], ["First", "Second"])
+        options["tue", "lunch"] = [first]
+        with self.assertRaisesRegex(calori.CaloriError, "No complete plan"):
+            calori.plan_calorie_meals(options, calori.Counter())
+
+    def test_reserves_a_meal_that_is_the_only_choice_for_a_later_day(self):
+        shared: calori.MealChoice = {"name": "Shared", "meal_id": "shared", "calories": 2500}
+        alternative: calori.MealChoice = {
+            "name": "Alternative",
+            "meal_id": "other",
+            "calories": 2400,
+        }
+        options = {("mon", "lunch"): [shared, alternative], ("tue", "lunch"): [shared]}
+        plan = calori.plan_calorie_meals(options, calori.Counter())
+        self.assertEqual([meal["name"] for meal in plan.values()], ["Alternative", "Shared"])
+
+    def test_optimizes_calorie_deviations_across_the_whole_week(self):
+        shared: calori.MealChoice = {"name": "Shared", "meal_id": "shared", "calories": 2500}
+        monday: calori.MealChoice = {"name": "Monday", "meal_id": "monday", "calories": 2400}
+        tuesday: calori.MealChoice = {"name": "Tuesday", "meal_id": "tuesday", "calories": 2000}
+        options = {("mon", "lunch"): [shared, monday], ("tue", "lunch"): [shared, tuesday]}
+        plan = calori.plan_calorie_meals(options, calori.Counter())
+        self.assertEqual([meal["name"] for meal in plan.values()], ["Monday", "Shared"])
+
+    def test_equal_total_deviation_prefers_a_smaller_worst_day(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "lunch"): [
+                {"name": "First", "meal_id": "first-mon", "calories": 2500},
+                {"name": "Second", "meal_id": "second-mon", "calories": 2300},
+            ],
+            ("tue", "lunch"): [
+                {"name": "First", "meal_id": "first-tue", "calories": 2200},
+                {"name": "Second", "meal_id": "second-tue", "calories": 2000},
+            ],
+        }
+        plan = calori.plan_calorie_meals(options, calori.Counter())
+        self.assertEqual([meal["name"] for meal in plan.values()], ["Second", "First"])
+        self.assertEqual(sum(abs(meal["calories"] - 2500) for meal in plan.values()), 500)
+        self.assertEqual(max(abs(meal["calories"] - 2500) for meal in plan.values()), 300)
+
+    def test_unproven_solver_results_are_rejected(self):
+        result = mock.Mock(
+            status=calori.pulp.constants.LpSolveStatus.NotSolved,
+            has_solution=True,
+            objective=0,
+        )
+        with (
+            mock.patch.object(calori.pulp.LpProblem, "solve", return_value=result),
+            self.assertRaisesRegex(calori.CaloriError, "proven optimal"),
+        ):
+            calori.plan_calorie_meals(self.options, calori.Counter())
+
+    def test_solver_failure_reports_a_clear_error(self):
+        with (
+            mock.patch.object(
+                calori.pulp.LpProblem, "solve", side_effect=calori.pulp.PulpSolverError("Failed")
             ),
-            expected,
+            self.assertRaisesRegex(calori.CaloriError, "Cannot run the weekly meal optimizer"),
+        ):
+            calori.plan_calorie_meals(self.options, calori.Counter())
+
+    def test_custom_target_and_input_order_do_not_change_the_objective(self):
+        expected = calori.plan_calorie_meals(self.options, calori.Counter(), 2100)
+        self.assertEqual(sum(meal["calories"] for meal in expected.values()), 2100)
+        reversed_options = {
+            slot: list(reversed(choices)) for slot, choices in reversed(self.options.items())
+        }
+        self.assertEqual(
+            calori.plan_calorie_meals(reversed_options, calori.Counter(), 2100), expected
         )
 
-    def test_fails_instead_of_reusing_a_meal_or_filling_an_unavailable_slot(self):
-        for eaten, slots in [
-            ({"Banana Quark", "Previous meal"}, self.slots),
-            (set(), self.slots + [("wed", "breakfast")]),
-        ]:
+    def test_incomplete_or_invalid_options_fail_without_relaxing_uniqueness(self):
+        self.options["mon", "breakfast"] = []
+        with self.assertRaisesRegex(calori.CaloriError, "No complete plan"):
+            calori.plan_calorie_meals(self.options, calori.Counter())
+        for options, target in [({}, 2500), (self.options, 0), ({("bad", "lunch"): []}, 2500)]:
             with (
-                self.subTest(eaten=eaten, slots=slots),
-                self.assertRaisesRegex(calori.CaloriError, "No complete plan"),
+                self.subTest(options=options, target=target),
+                self.assertRaises(calori.CaloriError),
             ):
-                calori.plan_unique_meals(self.opportunities, eaten, slots)
+                calori.plan_calorie_meals(options, calori.Counter(), target)
 
-    def test_rejects_empty_duplicate_and_unknown_slots(self):
-        for slots in [[], self.slots * 2, [("unknown", "breakfast")]]:
-            with self.subTest(slots=slots), self.assertRaises(calori.CaloriError):
-                calori.plan_unique_meals(self.opportunities, set(), slots)
+    def test_nonfinite_nonpositive_or_boolean_calories_are_rejected(self):
+        for calories in [float("nan"), float("inf"), 0, -1, True]:
+            with (
+                self.subTest(calories=calories),
+                self.assertRaisesRegex(calori.CaloriError, "calories"),
+            ):
+                self.options["mon", "breakfast"][0]["calories"] = calories
+                calori.plan_calorie_meals(self.options, calori.Counter())
 
 
 class SelectionTests(unittest.TestCase):
@@ -455,6 +559,16 @@ class SelectionTests(unittest.TestCase):
         self.client.templates = [
             {"id": name, "name": name, "small_id": name + "-small", "large_id": name + "-large"}
             for name in ["Apple Delight", "Banana Quark", "Previous meal", "Current meal"]
+        ]
+        self.client.meals = [
+            {"id": name + "-" + size, "calories": calories}
+            for name, sizes in {
+                "Apple Delight": (600, 1400),
+                "Banana Quark": (1100, 1100),
+                "Previous meal": (900, 1900),
+                "Current meal": (700, 1300),
+            }.items()
+            for size, calories in zip(("small", "large"), sizes, strict=True)
         ]
         self.client.availability = [
             {"day_of_week": "mon", "meal_time": meal_time, "generic_id": name}
@@ -488,6 +602,8 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan["monday"], self.monday)
         self.assertEqual(plan["week_id"], "2026-10-19")
         self.assertEqual(plan["subscription_id"], "test-subscription")
+        self.assertEqual(plan["target_calories"], 2500)
+        self.assertEqual(plan["daily_calories"], {"mon": 2500})
         self.assertEqual(
             [(meal["slot"], meal["name"], meal["meal_id"]) for meal in plan["meals"]],
             [
@@ -497,10 +613,40 @@ class SelectionTests(unittest.TestCase):
         )
         self.assertEqual({path: path.read_bytes() for path in originals}, originals)
 
-    def test_excludes_choices_without_the_required_meal_size(self):
+    def test_prepares_and_applies_unique_meals_across_multiple_days(self):
+        self.selections.append(dict(self.selections[0], id="selection-tuesday", day_of_week="tue"))
+        self.client.availability.append(
+            {"day_of_week": "tue", "meal_time": "breakfast", "generic_id": "Banana Quark"}
+        )
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(
+            [meal["name"] for meal in plan["meals"]],
+            ["Apple Delight", "Previous meal", "Banana Quark"],
+        )
+        self.assertEqual(len({meal["name"] for meal in plan["meals"]}), 3)
+        self.assertEqual(calori.apply_selection_plan(self.client, plan), 3)
+
+    def test_duplicate_planned_names_prevent_all_writes(self):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        plan["meals"][1]["name"] = plan["meals"][0]["name"]
+        with self.assertRaisesRegex(calori.CaloriError, "duplicate meal names"):
+            calori.apply_selection_plan(self.client, plan)
+        self.assertEqual(self.client.patches, [])
+
+    def test_excludes_unavailable_sizes_but_allows_previously_eaten_meals(self):
         del self.client.templates[1]["small_id"]
-        with self.assertRaisesRegex(calori.CaloriError, "No complete plan"):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(
+            [meal["name"] for meal in plan["meals"]], ["Apple Delight", "Previous meal"]
+        )
+        self.assertEqual([meal["eaten"] for meal in plan["meals"]], [0, 1])
+        self.assertEqual(plan["daily_calories"], {"mon": 2500})
+
+    def test_missing_calories_fail_before_saving_selections(self):
+        self.client.meals = []
+        with self.assertRaisesRegex(calori.CaloriError, "calories"):
             calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(self.client.patches, [])
 
     def test_rejects_closed_weeks_and_unknown_current_meal_sizes(self):
         self.client.week_closed = True
@@ -608,7 +754,10 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(calori.main(arguments), 0)
         preview = yaml.safe_load(output.getvalue())
         self.assertEqual(preview["week"], "2026-10-19")
+        self.assertEqual(preview["target_calories"], 2500)
+        self.assertEqual(preview["daily_calories"], {"mon": 2500})
         self.assertEqual(len(preview["meals"]), 2)
+        self.assertEqual(sum(meal["calories"] for meal in preview["meals"]), 2500)
         self.assertNotIn("test-subscription", output.getvalue())
         self.assertIn("Preview only", errors.getvalue())
         self.assertEqual(self.client.patches, [])
@@ -624,10 +773,37 @@ class SelectionTests(unittest.TestCase):
         self.assertIn("Saved 2 meal changes", errors.getvalue())
         saved = yaml.safe_load((self.output_dir / "2026/week43.yaml").read_text())
         self.assertEqual([meal["meal"] for meal in saved["mon"]], ["Banana Quark", "Apple Delight"])
+        self.assertEqual(sum(meal["macros"]["calories"] for meal in saved["mon"]), 2500)
         self.assertEqual(
             yaml.safe_load((self.output_dir / "stats.yaml").read_text()),
             [{"meals": [{"name": "Previous meal", "eaten": 1}]}],
         )
+
+    def test_custom_calorie_target_is_used_in_the_command_preview(self):
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(
+                calori.main(["select", "--calories", "3000", "--output-dir", str(self.output_dir)]),
+                0,
+            )
+        preview = yaml.safe_load(output.getvalue())
+        self.assertEqual(preview["target_calories"], 3000)
+        self.assertEqual(preview["daily_calories"], {"mon": 3000})
+        self.assertEqual(self.client.patches, [])
+
+    def test_invalid_calorie_targets_fail_before_network_access(self):
+        for target in ["0", "-1", "invalid"]:
+            with (
+                self.subTest(target=target),
+                mock.patch("calori.CaloriClient") as client,
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                calori.main(["select", "--calories", target])
+            client.assert_not_called()
 
     def test_impossible_plan_fails_before_changes_to_calori_or_local_files(self):
         self.client.availability = self.client.availability[:2]

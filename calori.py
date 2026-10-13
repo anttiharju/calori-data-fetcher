@@ -14,13 +14,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from decimal import Decimal
 from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
 from typing import TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import networkx as nx
+import pulp
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.error import YAMLError
@@ -55,18 +56,25 @@ class MealOpportunity(TypedDict):
     spots: list[str]
 
 
-class PlannedSelection(TypedDict):
+class MealChoice(TypedDict):
+    meal_id: str
+    name: str
+    calories: float
+
+
+class PlannedSelection(MealChoice):
     slot: tuple[str, str]
     id: str
     previous_meal_id: str
-    meal_id: str
-    name: str
+    eaten: int
 
 
 class SelectionPlan(TypedDict):
     monday: dt.date
     week_id: str
     subscription_id: str
+    target_calories: int
+    daily_calories: dict[str, float]
     meals: list[PlannedSelection]
 
 
@@ -442,42 +450,104 @@ def rank_meal_opportunities(rows, templates) -> list[MealOpportunity]:
     )
 
 
-def plan_unique_meals(
-    opportunities: list[MealOpportunity],
-    eaten: set[str],
-    slots: list[tuple[str, str]],
-) -> dict[tuple[str, str], str]:
-    if not slots or len(slots) != len(set(slots)):
-        raise CaloriError("The week has missing or duplicate meal slots.")
-    if any(day not in DAY_OFFSETS or meal_time not in MEAL_ORDER for day, meal_time in slots):
-        raise CaloriError("The API returned an unknown day or meal slot.")
-    ordered_slots = sorted(slots, key=lambda slot: (DAY_OFFSETS[slot[0]], MEAL_ORDER[slot[1]]))
-    available = {meal["name"]: meal for meal in opportunities if meal["name"] not in eaten}
-    names = sorted(
-        available,
-        key=lambda name: (available[name]["opportunities"], name.casefold(), name),
-    )
-    slot_nodes = {slot: index for index, slot in enumerate(ordered_slots)}
-    graph = nx.Graph()
-    graph.add_nodes_from(slot_nodes.values(), bipartite=0)
-    for index, name in enumerate(names, start=len(ordered_slots)):
-        for spot in available[name]["spots"]:
-            day, _separator, meal_time = spot.partition("/")
-            slot = (day, meal_time)
-            if slot in slot_nodes:
-                graph.add_edge(slot_nodes[slot], index)
-    matches = nx.algorithms.bipartite.maximum_matching(graph, top_nodes=slot_nodes.values())
-    plan = {
-        slot: names[matches[node] - len(ordered_slots)]
-        for slot, node in slot_nodes.items()
-        if node in matches
-    }
-    if len(plan) != len(slots):
-        raise CaloriError(
-            "No complete plan exists with uneaten, unique meals. "
-            f"Only {len(plan)} of {len(slots)} slots can be filled."
+def plan_calorie_meals(
+    options: dict[tuple[str, str], list[MealChoice]],
+    eaten: Counter[str],
+    target_calories: int = 2500,
+) -> dict[tuple[str, str], MealChoice]:
+    if target_calories < 1:
+        raise CaloriError("Use a positive daily calorie target.")
+    if not options or any(
+        day not in DAY_OFFSETS or meal_time not in MEAL_ORDER for day, meal_time in options
+    ):
+        raise CaloriError("The week has missing or unknown meal slots.")
+    calories_by_id = {}
+    for choices in options.values():
+        for choice in choices:
+            value = choice.get("calories")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise CaloriError("A meal has missing or invalid calories.")
+            calories = Decimal(str(value))
+            if not calories.is_finite() or calories <= 0:
+                raise CaloriError("A meal has missing or invalid calories.")
+            calories_by_id[choice["meal_id"]] = calories
+
+    if any(not choices for choices in options.values()):
+        raise CaloriError("No complete plan with unique meals exists for the week.")
+    scale = 10 ** max(0, max(-int(value.as_tuple().exponent) for value in calories_by_id.values()))
+    slots = sorted(options, key=lambda slot: (DAY_OFFSETS[slot[0]], MEAL_ORDER[slot[1]]))
+    model = pulp.LpProblem("weekly_meals", pulp.LpMinimize)
+    candidates = []
+    for slot in slots:
+        for choice in sorted(
+            options[slot],
+            key=lambda choice: (choice["name"].casefold(), choice["name"], choice["meal_id"]),
+        ):
+            variable = model.add_variable(f"meal_{len(candidates)}", cat=pulp.LpBinary)
+            candidates.append((slot, choice, variable))
+    for slot in slots:
+        model += (
+            pulp.lpSum(
+                variable for candidate_slot, _, variable in candidates if candidate_slot == slot
+            )
+            == 1
         )
-    return plan
+    for name in sorted({choice["name"] for _, choice, _ in candidates}):
+        model += (
+            pulp.lpSum(variable for _, choice, variable in candidates if choice["name"] == name)
+            <= 1
+        )
+
+    deviations = []
+    worst_deviation = model.add_variable("worst_deviation", lowBound=0)
+    for day in DAY_OFFSETS:
+        if not any(slot[0] == day for slot in slots):
+            continue
+        calories = pulp.lpSum(
+            int(calories_by_id[choice["meal_id"]] * scale) * variable
+            for slot, choice, variable in candidates
+            if slot[0] == day
+        )
+        deviation = model.add_variable(f"deviation_{day}", lowBound=0)
+        model += deviation >= calories - target_calories * scale
+        model += deviation >= target_calories * scale - calories
+        model += worst_deviation >= deviation
+        deviations.append(deviation)
+
+    history_weight = len(candidates) * len(slots) + 1
+    preferences = pulp.lpSum(
+        (eaten[choice["name"]] * history_weight + index) * variable
+        for index, (_, choice, variable) in enumerate(candidates)
+    )
+    solver = pulp.HiGHS(msg=False, timeLimit=30, threads=1, gapRel=0, gapAbs=0)
+    for objective in (pulp.lpSum(deviations), worst_deviation, preferences):
+        model.setObjective(objective)
+        try:
+            solution = model.solve(solver)
+        except pulp.PulpSolverError, OSError:
+            raise CaloriError("Cannot run the weekly meal optimizer.") from None
+        if solution.status == pulp.constants.LpSolveStatus.Infeasible:
+            raise CaloriError("No complete plan with unique meals exists for the week.")
+        if (
+            solution.status != pulp.constants.LpSolveStatus.Optimal
+            or not solution.has_solution
+            or solution.objective is None
+        ):
+            raise CaloriError(
+                "The weekly meal optimizer did not find a proven optimal plan within its time limit."
+            )
+        model += objective == round(solution.objective)
+
+    result = {}
+    for slot, choice, variable in candidates:
+        selected = pulp.value(variable)
+        if selected is not None and selected > 0.5:
+            result[slot] = choice
+    if len(result) != len(slots) or len({choice["name"] for choice in result.values()}) != len(
+        slots
+    ):
+        raise CaloriError("The optimizer did not return a complete plan with unique meals.")
+    return result
 
 
 def get_week_id(client, monday, *, require_open=False):
@@ -592,14 +662,14 @@ def selection_state(rows) -> dict[tuple[str, str], tuple[str, str]]:
     return state
 
 
-def prepare_selection_plan(client, output_dir: Path) -> SelectionPlan:
+def prepare_selection_plan(client, output_dir: Path, target_calories: int = 2500) -> SelectionPlan:
     weeks = exported_weeks(output_dir)
     if not weeks:
         raise CaloriError("No exported weeks exist. Run: uv run calori.py fetch")
     monday = weeks[-1][0]
     if monday < current_monday():
         raise CaloriError("The latest exported week is in the past. Run the fetch command again.")
-    eaten = set(count_selected_meals(weeks[:-1]))
+    eaten = count_selected_meals(weeks[:-1])
     week_id = get_week_id(client, monday, require_open=True)
     subscription_id = get_subscription_id(client)
     selections = get_selections(
@@ -617,13 +687,14 @@ def prepare_selection_plan(client, output_dir: Path) -> SelectionPlan:
                 variants[template[field]] = field
     if any(meal_id not in variants for _selection_id, meal_id in state.values()):
         raise CaloriError("Cannot determine the size of a current meal.")
+    meal_variants = get_menu_rows(client, "/rest/v1/meals", {"select": "id,calories"})
+    calories_by_id = {meal["id"]: meal.get("calories") for meal in meal_variants}
     rows = get_menu_rows(
         client,
         "/rest/v1/consumption_slots_mixed",
         {"select": "day_of_week,meal_time,generic_id", "week_id": "eq." + week_id},
     )
-    eligible = []
-    candidates: dict[tuple[tuple[str, str], str], str] = {}
+    candidates: dict[tuple[str, str], dict[str, MealChoice]] = {slot: {} for slot in state}
     for row in rows:
         slot = (row.get("day_of_week"), row.get("meal_time"))
         if slot not in state:
@@ -636,27 +707,40 @@ def prepare_selection_plan(client, output_dir: Path) -> SelectionPlan:
             raise CaloriError("The API returned a missing or unnamed meal template.")
         meal_id = template.get(variants[state[slot][1]])
         if isinstance(meal_id, str) and meal_id:
-            eligible.append(row)
-            candidates.setdefault((slot, name), meal_id)
-    names = plan_unique_meals(rank_meal_opportunities(eligible, templates), eaten, list(state))
+            calories = calories_by_id.get(meal_id)
+            if isinstance(calories, bool) or not isinstance(calories, (int, float)):
+                raise CaloriError(f"Missing or invalid calories for {name}.")
+            candidates[slot].setdefault(
+                meal_id, {"meal_id": meal_id, "name": name, "calories": calories}
+            )
+    choices = plan_calorie_meals(
+        {slot: list(meals.values()) for slot, meals in candidates.items()}, eaten, target_calories
+    )
+    daily_calories: dict[str, Decimal] = {}
+    for (day, _meal_time), choice in choices.items():
+        daily_calories[day] = daily_calories.get(day, Decimal(0)) + Decimal(str(choice["calories"]))
     return {
         "monday": monday,
         "week_id": week_id,
         "subscription_id": subscription_id,
+        "target_calories": target_calories,
+        "daily_calories": {day: float(calories) for day, calories in daily_calories.items()},
         "meals": [
             {
                 "slot": slot,
                 "id": state[slot][0],
                 "previous_meal_id": state[slot][1],
-                "meal_id": candidates[slot, name],
-                "name": name,
+                **choice,
+                "eaten": eaten[choice["name"]],
             }
-            for slot, name in names.items()
+            for slot, choice in choices.items()
         ],
     }
 
 
 def apply_selection_plan(client, plan: SelectionPlan) -> int:
+    if len({meal["name"] for meal in plan["meals"]}) != len(plan["meals"]):
+        raise CaloriError("The planned week contains duplicate meal names.")
     if plan["monday"] < current_monday():
         raise CaloriError("The planned week is in the past. Run the fetch command again.")
     if get_week_id(client, plan["monday"], require_open=True) != plan["week_id"]:
@@ -740,7 +824,7 @@ def positive_integer(value):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Export Calori meals or select unique, uneaten meals."
+        description="Export Calori meals or plan meals toward a daily calorie target."
     )
     commands = parser.add_subparsers(dest="command", required=True)
     login = commands.add_parser("login", help="Sign in and store a private local session.")
@@ -763,7 +847,7 @@ def main(argv=None):
         help="Directory for weekly YAML files and stats.yaml. Default: data.",
     )
     select = commands.add_parser(
-        "select", help="Preview unique, uneaten meals for the latest exported week."
+        "select", help="Preview daily calorie targets with unique meals across the week."
     )
     select.add_argument(
         "--output-dir",
@@ -773,6 +857,12 @@ def main(argv=None):
     )
     select.add_argument(
         "--apply", action="store_true", help="Save the plan to Calori. Default: preview only."
+    )
+    select.add_argument(
+        "--calories",
+        type=positive_integer,
+        default=2500,
+        help="Target calories per day. Default: 2500.",
     )
     args = parser.parse_args(argv)
     try:
@@ -800,13 +890,20 @@ def main(argv=None):
         else:
             client = CaloriClient()
             if args.command == "select":
-                plan = prepare_selection_plan(client, args.output_dir)
+                plan = prepare_selection_plan(client, args.output_dir, args.calories)
                 print(
                     dump_yaml(
                         {
                             "week": plan["monday"].isoformat(),
+                            "target_calories": plan["target_calories"],
+                            "daily_calories": plan["daily_calories"],
                             "meals": [
-                                {"spot": "/".join(meal["slot"]), "name": meal["name"]}
+                                {
+                                    "spot": "/".join(meal["slot"]),
+                                    "name": meal["name"],
+                                    "calories": meal["calories"],
+                                    "eaten": meal["eaten"],
+                                }
                                 for meal in plan["meals"]
                             ],
                         }
