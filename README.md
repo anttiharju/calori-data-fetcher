@@ -102,10 +102,25 @@ For a different daily calorie target, run:
 uv run calori.py select --calories 2400
 ```
 
+To prefer uneaten meals with at least 2,100 calories every day, run:
+
+```sh
+uv run calori.py select --kcal-floor 2100
+```
+
+The floor is a hard minimum for each day, not a weekly average.
+This mode prioritizes meal variety before calorie closeness. The preview includes the requested `kcal_floor`.
+
 To save the plan to Calori, run:
 
 ```sh
 uv run calori.py select --apply
+```
+
+To save a plan with a daily floor, run:
+
+```sh
+uv run calori.py select --kcal-floor 2100 --apply
 ```
 
 The `--apply` option changes your selections on Calori. Each run builds a fresh plan from the live API menu.
@@ -115,18 +130,27 @@ Previously eaten meals remain eligible.
 
 The planner uses PuLP 4 and HiGHS to optimize the whole week together.
 Each meal name can appear only once in the week, even across different portion sizes.
-The planner applies these priorities in order:
+Without `--kcal-floor`, the planner applies these priorities in order:
 
 1. Smallest sum of absolute daily differences from the calorie target.
 2. Smallest difference for the day furthest from the target.
 3. Lowest total historical eaten count for the week.
 
+With `--kcal-floor`, every day must meet the floor. The planner then applies these priorities in order:
+
+1. Most meals absent from the preference history.
+2. Lowest total historical eaten count for the week.
+3. Smallest sum of absolute daily differences from the calorie target.
+4. Smallest difference for the day furthest from the target.
+
+The `--calories` option remains a soft target in floor mode. It is not an upper limit.
 Meal names and variant IDs define stable weights for remaining ties.
 The command preserves each slot's meal size and does not add slots.
 Calories come from the actual meal variants, not template nutrition. Exact daily totals are not always possible.
 Defaults remain eligible, regardless of the website chooser filters.
 
 If the week has no full plan with unique meals, the command stops without changes.
+An impossible calorie floor also stops the command without changes. The planner never lowers the floor automatically.
 Each optimization stage has a 30-second limit. The command stops if the solver cannot prove an optimal result within that limit.
 Missing or invalid calorie values also cause an error.
 Closed weeks and weeks in the past cause an error.

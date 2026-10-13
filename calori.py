@@ -70,6 +70,7 @@ class SelectionPlan(TypedDict):
     week_id: str
     subscription_id: str
     target_calories: int
+    kcal_floor: int | None
     daily_calories: dict[str, float]
     meals: list[PlannedSelection]
 
@@ -421,9 +422,13 @@ def plan_calorie_meals(
     options: dict[tuple[str, str], list[MealChoice]],
     eaten: Counter[str],
     target_calories: int = 2500,
+    *,
+    kcal_floor: int | None = None,
 ) -> dict[tuple[str, str], MealChoice]:
     if target_calories < 1:
         raise CaloriError("Use a positive daily calorie target.")
+    if kcal_floor is not None and kcal_floor < 1:
+        raise CaloriError("Use a positive daily calorie floor.")
     if not options or any(
         day not in DAY_OFFSETS or meal_time not in MEAL_ORDER for day, meal_time in options
     ):
@@ -475,6 +480,8 @@ def plan_calorie_meals(
             for slot, choice, variable in candidates
             if slot[0] == day
         )
+        if kcal_floor is not None:
+            model += calories >= kcal_floor * scale
         deviation = model.add_variable(f"deviation_{day}", lowBound=0)
         model += deviation >= calories - target_calories * scale
         model += deviation >= target_calories * scale - calories
@@ -482,18 +489,40 @@ def plan_calorie_meals(
         deviations.append(deviation)
 
     history_weight = len(candidates) * len(slots) + 1
-    preferences = pulp.lpSum(
-        (eaten[choice["name"]] * history_weight + index) * variable
-        for index, (_, choice, variable) in enumerate(candidates)
+    history_cost = pulp.lpSum(
+        eaten[choice["name"]] * variable for _, choice, variable in candidates
     )
+    stable_order = pulp.lpSum(
+        index * variable for index, (_, choice, variable) in enumerate(candidates)
+    )
+    objectives = (
+        pulp.lpSum(deviations),
+        worst_deviation,
+        history_cost * history_weight + stable_order,
+    )
+    if kcal_floor is not None:
+        previously_eaten = pulp.lpSum(
+            variable for _, choice, variable in candidates if eaten[choice["name"]] > 0
+        )
+        objectives = (
+            previously_eaten,
+            history_cost,
+            pulp.lpSum(deviations),
+            worst_deviation,
+            stable_order,
+        )
     solver = pulp.HiGHS(msg=False, timeLimit=30, threads=1, gapRel=0, gapAbs=0)
-    for objective in (pulp.lpSum(deviations), worst_deviation, preferences):
+    for objective in objectives:
         model.setObjective(objective)
         try:
             solution = model.solve(solver)
         except pulp.PulpSolverError, OSError:
             raise CaloriError("Cannot run the weekly meal optimizer.") from None
         if solution.status == pulp.constants.LpSolveStatus.Infeasible:
+            if kcal_floor is not None:
+                raise CaloriError(
+                    f"No complete plan with unique meals meets the {kcal_floor} kcal floor on every day."
+                )
             raise CaloriError("No complete plan with unique meals exists for the week.")
         if (
             solution.status != pulp.constants.LpSolveStatus.Optimal
@@ -514,6 +543,15 @@ def plan_calorie_meals(
         slots
     ):
         raise CaloriError("The optimizer did not return a complete plan with unique meals.")
+    if kcal_floor is not None:
+        for day in {slot[0] for slot in slots}:
+            calories = sum(
+                calories_by_id[choice["meal_id"]]
+                for slot, choice in result.items()
+                if slot[0] == day
+            )
+            if calories < kcal_floor:
+                raise CaloriError("The optimizer returned a plan below the daily calorie floor.")
     return result
 
 
@@ -623,7 +661,9 @@ def selection_state(rows) -> dict[tuple[str, str], tuple[str, str]]:
     return state
 
 
-def prepare_selection_plan(client, output_dir: Path, target_calories: int = 2500) -> SelectionPlan:
+def prepare_selection_plan(
+    client, output_dir: Path, target_calories: int = 2500, *, kcal_floor: int | None = None
+) -> SelectionPlan:
     weeks = exported_weeks(output_dir)
     if not weeks:
         raise CaloriError("No exported weeks exist. Run: uv run calori.py fetch")
@@ -675,7 +715,10 @@ def prepare_selection_plan(client, output_dir: Path, target_calories: int = 2500
                 meal_id, {"meal_id": meal_id, "name": name, "calories": calories}
             )
     choices = plan_calorie_meals(
-        {slot: list(meals.values()) for slot, meals in candidates.items()}, eaten, target_calories
+        {slot: list(meals.values()) for slot, meals in candidates.items()},
+        eaten,
+        target_calories,
+        kcal_floor=kcal_floor,
     )
     daily_calories: dict[str, Decimal] = {}
     for (day, _meal_time), choice in choices.items():
@@ -685,6 +728,7 @@ def prepare_selection_plan(client, output_dir: Path, target_calories: int = 2500
         "week_id": week_id,
         "subscription_id": subscription_id,
         "target_calories": target_calories,
+        "kcal_floor": kcal_floor,
         "daily_calories": {day: float(calories) for day, calories in daily_calories.items()},
         "meals": [
             {
@@ -702,6 +746,13 @@ def prepare_selection_plan(client, output_dir: Path, target_calories: int = 2500
 def apply_selection_plan(client, plan: SelectionPlan) -> int:
     if len({meal["name"] for meal in plan["meals"]}) != len(plan["meals"]):
         raise CaloriError("The planned week contains duplicate meal names.")
+    if plan["kcal_floor"] is not None:
+        for day in {meal["slot"][0] for meal in plan["meals"]}:
+            calories = sum(
+                Decimal(str(meal["calories"])) for meal in plan["meals"] if meal["slot"][0] == day
+            )
+            if calories < plan["kcal_floor"]:
+                raise CaloriError("The planned week contains a day below its calorie floor.")
     if plan["monday"] < current_monday():
         raise CaloriError("The planned week is in the past. Run the fetch command again.")
     if get_week_id(client, plan["monday"], require_open=True) != plan["week_id"]:
@@ -808,7 +859,7 @@ def main(argv=None):
         help="Directory for weekly YAML files and stats.yaml. Default: data.",
     )
     select = commands.add_parser(
-        "select", help="Preview daily calorie targets with unique meals across the week."
+        "select", help="Preview unique weekly meals with a calorie target or floor."
     )
     select.add_argument(
         "--output-dir",
@@ -824,6 +875,11 @@ def main(argv=None):
         type=positive_integer,
         default=2500,
         help="Target calories per day. Default: 2500.",
+    )
+    select.add_argument(
+        "--kcal-floor",
+        type=positive_integer,
+        help="Minimum calories each day. Prefer uneaten meals before calorie closeness.",
     )
     args = parser.parse_args(argv)
     try:
@@ -851,12 +907,19 @@ def main(argv=None):
         else:
             client = CaloriClient()
             if args.command == "select":
-                plan = prepare_selection_plan(client, args.output_dir, args.calories)
+                plan = prepare_selection_plan(
+                    client, args.output_dir, args.calories, kcal_floor=args.kcal_floor
+                )
                 print(
                     dump_yaml(
                         {
                             "week": plan["monday"].isoformat(),
                             "target_calories": plan["target_calories"],
+                            **(
+                                {"kcal_floor": plan["kcal_floor"]}
+                                if plan["kcal_floor"] is not None
+                                else {}
+                            ),
                             "daily_calories": plan["daily_calories"],
                             "meals": [
                                 {

@@ -421,6 +421,81 @@ class CaloriePlanningTests(unittest.TestCase):
             ):
                 calori.plan_calorie_meals(options, calori.Counter(), target)
 
+    def test_floor_prioritizes_uneaten_meals_over_the_calorie_target(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "lunch"): [
+                {"name": "Familiar", "meal_id": "familiar", "calories": 2500},
+                {"name": "New", "meal_id": "new", "calories": 2200},
+            ]
+        }
+        eaten = calori.Counter({"Familiar": 1})
+        target_plan = calori.plan_calorie_meals(options, eaten)
+        floor_plan = calori.plan_calorie_meals(options, eaten, kcal_floor=2100)
+        self.assertEqual(target_plan["mon", "lunch"]["name"], "Familiar")
+        self.assertEqual(floor_plan["mon", "lunch"]["name"], "New")
+
+    def test_floor_prefers_lower_counts_when_every_meal_was_previously_eaten(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "lunch"): [
+                {"name": "Frequent", "meal_id": "frequent", "calories": 2500},
+                {"name": "Rare", "meal_id": "rare", "calories": 2200},
+            ]
+        }
+        plan = calori.plan_calorie_meals(
+            options, calori.Counter({"Frequent": 5, "Rare": 1}), kcal_floor=2100
+        )
+        self.assertEqual(plan["mon", "lunch"]["name"], "Rare")
+
+    def test_floor_maximizes_uneaten_meals_before_minimizing_total_history(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "breakfast"): [
+                {"name": "New", "meal_id": "new", "calories": 1900},
+                {"name": "Tried", "meal_id": "tried", "calories": 2200},
+            ],
+            ("mon", "lunch"): [
+                {"name": "Frequent", "meal_id": "frequent", "calories": 600},
+                {"name": "Rare", "meal_id": "rare", "calories": 300},
+            ],
+        }
+        plan = calori.plan_calorie_meals(
+            options, calori.Counter({"Tried": 1, "Frequent": 5, "Rare": 1}), kcal_floor=2500
+        )
+        self.assertEqual([meal["name"] for meal in plan.values()], ["New", "Frequent"])
+
+    def test_floor_applies_to_each_day_not_the_weekly_average(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "lunch"): [{"name": "Monday", "meal_id": "monday", "calories": 2600}],
+            ("tue", "lunch"): [
+                {"name": "Below floor", "meal_id": "below", "calories": 2099.9},
+                {"name": "Enough", "meal_id": "enough", "calories": 2100},
+            ],
+        }
+        plan = calori.plan_calorie_meals(options, calori.Counter({"Enough": 3}), kcal_floor=2100)
+        self.assertEqual(plan["tue", "lunch"]["name"], "Enough")
+        options["tue", "lunch"] = options["tue", "lunch"][:1]
+        with self.assertRaisesRegex(calori.CaloriError, "2100 kcal floor on every day"):
+            calori.plan_calorie_meals(options, calori.Counter(), kcal_floor=2100)
+
+    def test_floor_preserves_weekly_uniqueness_and_rejects_nonpositive_values(self):
+        first: calori.MealChoice = {"name": "First", "meal_id": "first", "calories": 2200}
+        second: calori.MealChoice = {"name": "Second", "meal_id": "second", "calories": 2300}
+        options = {("mon", "lunch"): [first], ("tue", "lunch"): [first, second]}
+        plan = calori.plan_calorie_meals(options, calori.Counter(), kcal_floor=2100)
+        self.assertEqual(len({meal["name"] for meal in plan.values()}), 2)
+        for floor in [0, -1]:
+            with self.subTest(floor=floor), self.assertRaisesRegex(calori.CaloriError, "positive"):
+                calori.plan_calorie_meals(options, calori.Counter(), kcal_floor=floor)
+
+    def test_floor_uses_calorie_closeness_to_break_equal_history_ties(self):
+        options: dict[tuple[str, str], list[calori.MealChoice]] = {
+            ("mon", "lunch"): [
+                {"name": "First", "meal_id": "first", "calories": 2100},
+                {"name": "Second", "meal_id": "second", "calories": 2400},
+            ]
+        }
+        plan = calori.plan_calorie_meals(options, calori.Counter(), kcal_floor=2100)
+        self.assertEqual(plan["mon", "lunch"]["name"], "Second")
+
     def test_nonfinite_nonpositive_or_boolean_calories_are_rejected(self):
         for calories in [float("nan"), float("inf"), 0, -1, True]:
             with (
@@ -488,6 +563,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(plan["week_id"], "2026-10-19")
         self.assertEqual(plan["subscription_id"], "test-subscription")
         self.assertEqual(plan["target_calories"], 2500)
+        self.assertIsNone(plan["kcal_floor"])
         self.assertEqual(plan["daily_calories"], {"mon": 2500})
         self.assertEqual(
             [(meal["slot"], meal["name"], meal["meal_id"]) for meal in plan["meals"]],
@@ -640,6 +716,7 @@ class SelectionTests(unittest.TestCase):
         preview = yaml.safe_load(output.getvalue())
         self.assertEqual(preview["week"], "2026-10-19")
         self.assertEqual(preview["target_calories"], 2500)
+        self.assertNotIn("kcal_floor", preview)
         self.assertEqual(preview["daily_calories"], {"mon": 2500})
         self.assertEqual(len(preview["meals"]), 2)
         self.assertEqual(sum(meal["calories"] for meal in preview["meals"]), 2500)
@@ -679,6 +756,83 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(preview["target_calories"], 3000)
         self.assertEqual(preview["daily_calories"], {"mon": 3000})
         self.assertEqual(self.client.patches, [])
+
+    def test_floor_command_previews_and_saves_a_more_varied_plan(self):
+        variant = next(meal for meal in self.client.meals if meal["id"] == "Banana Quark-small")
+        variant["calories"] = 900
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        arguments = ["select", "--kcal-floor", "2100", "--output-dir", str(self.output_dir)]
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(calori.main(arguments), 0)
+        preview = yaml.safe_load(output.getvalue())
+        self.assertEqual(preview["kcal_floor"], 2100)
+        self.assertEqual(preview["target_calories"], 2500)
+        self.assertEqual(preview["daily_calories"], {"mon": 2300})
+        self.assertTrue(all(meal["eaten"] == 0 for meal in preview["meals"]))
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(
+            {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}, originals
+        )
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(calori.main([*arguments, "--apply"]), 0)
+        saved = yaml.safe_load((self.output_dir / "2026/week43.yaml").read_text())
+        self.assertEqual(sum(meal["macros"]["calories"] for meal in saved["mon"]), 2300)
+        self.assertEqual(len(self.client.patches), 2)
+
+    def test_infeasible_floor_leaves_online_and_local_selections_unchanged(self):
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(
+                calori.main(
+                    [
+                        "select",
+                        "--kcal-floor",
+                        "3001",
+                        "--apply",
+                        "--output-dir",
+                        str(self.output_dir),
+                    ]
+                ),
+                1,
+            )
+        self.assertIn("3001 kcal floor", errors.getvalue())
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(
+            {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}, originals
+        )
+
+    def test_below_floor_plan_is_rejected_before_network_access(self):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir, kcal_floor=2100)
+        plan["meals"][0]["calories"] = 0
+        calls = list(self.client.calls)
+        with self.assertRaisesRegex(calori.CaloriError, "below its calorie floor"):
+            calori.apply_selection_plan(self.client, plan)
+        self.assertEqual(self.client.calls, calls)
+        self.assertEqual(self.client.patches, [])
+
+    def test_invalid_floor_values_fail_before_network_access(self):
+        for floor in ["0", "-1", "invalid"]:
+            with (
+                self.subTest(floor=floor),
+                mock.patch("calori.CaloriClient") as client,
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                calori.main(["select", "--kcal-floor", floor])
+            client.assert_not_called()
 
     def test_invalid_calorie_targets_fail_before_network_access(self):
         for target in ["0", "-1", "invalid"]:
