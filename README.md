@@ -1,4 +1,4 @@
-# Calori Data Fetcher
+# Calori Optimizer
 
 Export your selected Calori meals and available choices as weekly YAML files.
 The command also counts meals from earlier exports.

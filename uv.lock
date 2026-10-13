@@ -12,7 +12,7 @@ wheels = [
 ]
 
 [[package]]
-name = "calori-data-fetcher"
+name = "calori-optimizer"
 version = "0.3.0"
 source = { virtual = "." }
 dependencies = [

@@ -1,5 +1,5 @@
 [project]
-name = "calori-data-fetcher"
+name = "calori-optimizer"
 version = "0.3.0"
 description = "Export selected Calori meals as weekly YAML files."
 readme = "README.md"
