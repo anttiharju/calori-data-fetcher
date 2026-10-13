@@ -71,6 +71,7 @@ class SelectionPlan(TypedDict):
     subscription_id: str
     target_calories: int
     kcal_floor: int | None
+    include: list[str]
     daily_calories: dict[str, float]
     meals: list[PlannedSelection]
 
@@ -424,11 +425,15 @@ def plan_calorie_meals(
     target_calories: int = 2500,
     *,
     kcal_floor: int | None = None,
+    include: Iterable[str] = (),
 ) -> dict[tuple[str, str], MealChoice]:
     if target_calories < 1:
         raise CaloriError("Use a positive daily calorie target.")
     if kcal_floor is not None and kcal_floor < 1:
         raise CaloriError("Use a positive daily calorie floor.")
+    required_names = set(include)
+    if any(not isinstance(name, str) or not name.strip() for name in required_names):
+        raise CaloriError("Use a non-empty meal name with --include.")
     if not options or any(
         day not in DAY_OFFSETS or meal_time not in MEAL_ORDER for day, meal_time in options
     ):
@@ -464,11 +469,21 @@ def plan_calorie_meals(
             )
             == 1
         )
-    for name in sorted({choice["name"] for _, choice, _ in candidates}):
-        model += (
-            pulp.lpSum(variable for _, choice, variable in candidates if choice["name"] == name)
-            <= 1
+    available_names = {choice["name"] for _, choice, _ in candidates}
+    missing_names = required_names - available_names
+    if missing_names:
+        raise CaloriError(
+            "Included meals are unavailable for the requested slots: "
+            + ", ".join(sorted(missing_names))
         )
+    for name in sorted(available_names):
+        occurrences = pulp.lpSum(
+            variable for _, choice, variable in candidates if choice["name"] == name
+        )
+        if name in required_names:
+            model += occurrences == 1
+        else:
+            model += occurrences <= 1
 
     deviations = []
     worst_deviation = model.add_variable("worst_deviation", lowBound=0)
@@ -519,6 +534,11 @@ def plan_calorie_meals(
         except pulp.PulpSolverError, OSError:
             raise CaloriError("Cannot run the weekly meal optimizer.") from None
         if solution.status == pulp.constants.LpSolveStatus.Infeasible:
+            if required_names:
+                floor = f" and the {kcal_floor} kcal daily floor" if kcal_floor is not None else ""
+                raise CaloriError(
+                    f"No complete plan satisfies the included meals{floor} with weekly uniqueness."
+                )
             if kcal_floor is not None:
                 raise CaloriError(
                     f"No complete plan with unique meals meets the {kcal_floor} kcal floor on every day."
@@ -543,6 +563,8 @@ def plan_calorie_meals(
         slots
     ):
         raise CaloriError("The optimizer did not return a complete plan with unique meals.")
+    if not required_names <= {choice["name"] for choice in result.values()}:
+        raise CaloriError("The optimizer omitted an included meal.")
     if kcal_floor is not None:
         for day in {slot[0] for slot in slots}:
             calories = sum(
@@ -662,8 +684,14 @@ def selection_state(rows) -> dict[tuple[str, str], tuple[str, str]]:
 
 
 def prepare_selection_plan(
-    client, output_dir: Path, target_calories: int = 2500, *, kcal_floor: int | None = None
+    client,
+    output_dir: Path,
+    target_calories: int = 2500,
+    *,
+    kcal_floor: int | None = None,
+    include: Iterable[str] = (),
 ) -> SelectionPlan:
+    include = tuple(include)
     weeks = exported_weeks(output_dir)
     if not weeks:
         raise CaloriError("No exported weeks exist. Run: uv run calori.py fetch")
@@ -719,6 +747,7 @@ def prepare_selection_plan(
         eaten,
         target_calories,
         kcal_floor=kcal_floor,
+        include=include,
     )
     daily_calories: dict[str, Decimal] = {}
     for (day, _meal_time), choice in choices.items():
@@ -729,6 +758,7 @@ def prepare_selection_plan(
         "subscription_id": subscription_id,
         "target_calories": target_calories,
         "kcal_floor": kcal_floor,
+        "include": sorted(set(include)),
         "daily_calories": {day: float(calories) for day, calories in daily_calories.items()},
         "meals": [
             {
@@ -744,8 +774,11 @@ def prepare_selection_plan(
 
 
 def apply_selection_plan(client, plan: SelectionPlan) -> int:
-    if len({meal["name"] for meal in plan["meals"]}) != len(plan["meals"]):
+    selected_names = {meal["name"] for meal in plan["meals"]}
+    if len(selected_names) != len(plan["meals"]):
         raise CaloriError("The planned week contains duplicate meal names.")
+    if not set(plan["include"]) <= selected_names:
+        raise CaloriError("The planned week is missing an included meal.")
     if plan["kcal_floor"] is not None:
         for day in {meal["slot"][0] for meal in plan["meals"]}:
             calories = sum(
@@ -834,6 +867,12 @@ def positive_integer(value):
     return count
 
 
+def nonempty_meal_name(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("Use a non-empty meal name.")
+    return value
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Export Calori meals or plan meals toward a daily calorie target."
@@ -881,6 +920,14 @@ def main(argv=None):
         type=positive_integer,
         help="Minimum calories each day. Prefer uneaten meals before calorie closeness.",
     )
+    select.add_argument(
+        "--include",
+        action="append",
+        type=nonempty_meal_name,
+        default=[],
+        metavar="MEAL",
+        help="Require this exact meal name once in the week. Repeat for multiple meals.",
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "login":
@@ -908,7 +955,11 @@ def main(argv=None):
             client = CaloriClient()
             if args.command == "select":
                 plan = prepare_selection_plan(
-                    client, args.output_dir, args.calories, kcal_floor=args.kcal_floor
+                    client,
+                    args.output_dir,
+                    args.calories,
+                    kcal_floor=args.kcal_floor,
+                    include=args.include,
                 )
                 print(
                     dump_yaml(
@@ -920,6 +971,7 @@ def main(argv=None):
                                 if plan["kcal_floor"] is not None
                                 else {}
                             ),
+                            **({"include": plan["include"]} if plan["include"] else {}),
                             "daily_calories": plan["daily_calories"],
                             "meals": [
                                 {

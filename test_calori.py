@@ -496,6 +496,56 @@ class CaloriePlanningTests(unittest.TestCase):
         plan = calori.plan_calorie_meals(options, calori.Counter(), kcal_floor=2100)
         self.assertEqual(plan["mon", "lunch"]["name"], "Second")
 
+    def test_include_forces_an_eaten_meal_while_maximizing_other_uneaten_meals(self):
+        plan = calori.plan_calorie_meals(
+            self.options,
+            calori.Counter({"Big breakfast": 5, "Light lunch": 1}),
+            kcal_floor=2100,
+            include=["Big breakfast"],
+        )
+        self.assertEqual(
+            [meal["name"] for meal in plan.values()], ["Big breakfast", "Hearty lunch"]
+        )
+        self.assertGreaterEqual(sum(meal["calories"] for meal in plan.values()), 2100)
+
+    def test_include_also_applies_in_target_mode(self):
+        plan = calori.plan_calorie_meals(self.options, calori.Counter(), include=["Big breakfast"])
+        self.assertEqual(plan["mon", "breakfast"]["name"], "Big breakfast")
+
+    def test_multiple_inclusions_and_duplicate_requests_keep_weekly_uniqueness(self):
+        first: calori.MealChoice = {"name": "First", "meal_id": "first", "calories": 2500}
+        second: calori.MealChoice = {"name": "Second", "meal_id": "second", "calories": 2400}
+        options = {("mon", "lunch"): [first, second], ("tue", "lunch"): [first, second]}
+        plan = calori.plan_calorie_meals(
+            options, calori.Counter(), include=["First", "Second", "First"]
+        )
+        self.assertEqual(sorted(meal["name"] for meal in plan.values()), ["First", "Second"])
+
+    def test_unavailable_included_name_fails_before_solving(self):
+        with (
+            mock.patch.object(calori.pulp.LpProblem, "solve") as solve,
+            self.assertRaisesRegex(calori.CaloriError, "unavailable.*Unknown meal"),
+        ):
+            calori.plan_calorie_meals(self.options, calori.Counter(), include=["Unknown meal"])
+        solve.assert_not_called()
+
+    def test_inclusions_cannot_relax_the_floor_or_overfill_a_slot(self):
+        for names, floor in [
+            (["Small breakfast"], 2600),
+            (["Small breakfast", "Big breakfast"], None),
+        ]:
+            with (
+                self.subTest(names=names),
+                self.assertRaisesRegex(calori.CaloriError, "No complete plan.*included"),
+            ):
+                calori.plan_calorie_meals(
+                    self.options, calori.Counter(), kcal_floor=floor, include=names
+                )
+
+    def test_blank_included_names_are_rejected(self):
+        with self.assertRaisesRegex(calori.CaloriError, "non-empty meal name"):
+            calori.plan_calorie_meals(self.options, calori.Counter(), include=[" "])
+
     def test_nonfinite_nonpositive_or_boolean_calories_are_rejected(self):
         for calories in [float("nan"), float("inf"), 0, -1, True]:
             with (
@@ -717,6 +767,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(preview["week"], "2026-10-19")
         self.assertEqual(preview["target_calories"], 2500)
         self.assertNotIn("kcal_floor", preview)
+        self.assertNotIn("include", preview)
         self.assertEqual(preview["daily_calories"], {"mon": 2500})
         self.assertEqual(len(preview["meals"]), 2)
         self.assertEqual(sum(meal["calories"] for meal in preview["meals"]), 2500)
@@ -786,6 +837,103 @@ class SelectionTests(unittest.TestCase):
         saved = yaml.safe_load((self.output_dir / "2026/week43.yaml").read_text())
         self.assertEqual(sum(meal["macros"]["calories"] for meal in saved["mon"]), 2300)
         self.assertEqual(len(self.client.patches), 2)
+
+    def test_include_command_previews_and_applies_repeated_inclusion_flags(self):
+        arguments = [
+            "select",
+            "--kcal-floor",
+            "2164",
+            "--include",
+            "Previous meal",
+            "--include",
+            "Apple Delight",
+            "--include",
+            "Previous meal",
+            "--output-dir",
+            str(self.output_dir),
+        ]
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(calori.main(arguments), 0)
+        preview = yaml.safe_load(output.getvalue())
+        self.assertEqual(preview["include"], ["Apple Delight", "Previous meal"])
+        self.assertEqual(preview["kcal_floor"], 2164)
+        self.assertEqual(
+            [meal["name"] for meal in preview["meals"]], ["Apple Delight", "Previous meal"]
+        )
+        self.assertEqual(preview["daily_calories"], {"mon": 2500})
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(
+            {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}, originals
+        )
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(calori.main([*arguments, "--apply"]), 0)
+        saved = yaml.safe_load((self.output_dir / "2026/week43.yaml").read_text())
+        self.assertEqual(
+            [meal["meal"] for meal in saved["mon"]], ["Apple Delight", "Previous meal"]
+        )
+        self.assertEqual(len(self.client.patches), 2)
+
+    def test_unavailable_or_infeasible_inclusions_save_nothing(self):
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        for name, floor in [("Unknown meal", "2164"), ("Apple Delight", "2600")]:
+            with (
+                self.subTest(name=name),
+                mock.patch("calori.CaloriClient", return_value=self.client),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()) as errors,
+            ):
+                self.assertEqual(
+                    calori.main(
+                        [
+                            "select",
+                            "--include",
+                            name,
+                            "--kcal-floor",
+                            floor,
+                            "--apply",
+                            "--output-dir",
+                            str(self.output_dir),
+                        ]
+                    ),
+                    1,
+                )
+            self.assertIn("included", errors.getvalue().lower())
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(self.client.patches, [])
+            self.assertEqual(
+                {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}, originals
+            )
+
+    def test_missing_included_meal_is_rejected_before_network_access(self):
+        plan = calori.prepare_selection_plan(
+            self.client, self.output_dir, include=["Previous meal"]
+        )
+        plan["meals"][1]["name"] = "Different meal"
+        calls = list(self.client.calls)
+        with self.assertRaisesRegex(calori.CaloriError, "missing an included meal"):
+            calori.apply_selection_plan(self.client, plan)
+        self.assertEqual(self.client.calls, calls)
+        self.assertEqual(self.client.patches, [])
+
+    def test_blank_inclusion_flags_fail_before_network_access(self):
+        for name in ["", " "]:
+            with (
+                self.subTest(name=name),
+                mock.patch("calori.CaloriClient") as client,
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                calori.main(["select", "--include", name])
+            client.assert_not_called()
 
     def test_infeasible_floor_leaves_online_and_local_selections_unchanged(self):
         originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}

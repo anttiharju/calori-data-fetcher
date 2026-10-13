@@ -123,6 +123,24 @@ To save a plan with a daily floor, run:
 uv run calori.py select --kcal-floor 2100 --apply
 ```
 
+To require a specific meal in the plan, run:
+
+```sh
+uv run calori.py select --kcal-floor 2164 --include "Peanut Butter Delight"
+```
+
+To save that plan, run:
+
+```sh
+uv run calori.py select --kcal-floor 2164 --include "Peanut Butter Delight" --apply
+```
+
+The `--include` option requires an exact meal name. Each included meal must appear once in the week, even if you previously ate it.
+Repeated flags can require multiple meals. Repeated requests for the same name still require only one occurrence.
+
+The preview lists included names under `include`. The planner keeps the active mode's optimization priorities for the other meals.
+The option also works without `--kcal-floor`.
+
 The `--apply` option changes your selections on Calori. Each run builds a fresh plan from the live API menu.
 The planner reads its preference history directly from earlier weekly exports.
 It excludes the target week that it replaces, although the statistics include that week.
@@ -150,6 +168,7 @@ Calories come from the actual meal variants, not template nutrition. Exact daily
 Defaults remain eligible, regardless of the website chooser filters.
 
 If the week has no full plan with unique meals, the command stops without changes.
+Unavailable included meals and conflicting inclusion requests also stop the command without changes.
 An impossible calorie floor also stops the command without changes. The planner never lowers the floor automatically.
 Each optimization stage has a 30-second limit. The command stops if the solver cannot prove an optimal result within that limit.
 Missing or invalid calorie values also cause an error.
