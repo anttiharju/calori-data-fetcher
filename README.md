@@ -161,10 +161,10 @@ Example structure:
 
 ```yaml
 meals:
-	- name: Apple Delight
-		opportunities: 1
-		spots:
-			- mon/breakfast
+  - name: Apple Delight
+    opportunities: 1
+    spots:
+      - mon/breakfast
 ```
 
 Each meal contains these keys in order:
@@ -189,8 +189,8 @@ Example structure:
 
 ```yaml
 - meals:
-	- name: Apple Delight
-		eaten: 2
+    - name: Apple Delight
+      eaten: 2
 ```
 
 The `eaten` value counts each selected meal once, including repeated meals on the same day.
