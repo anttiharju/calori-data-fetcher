@@ -1,6 +1,9 @@
 # Calori Data Fetcher
 
-Export your selected Calori meals as weekly YAML files. The command uses the same API as the web dashboard.
+Export your selected Calori meals and available choices as weekly YAML files.
+The command also counts meals from earlier exports.
+The `select` command plans unique, uneaten meals for the latest exported week.
+The command uses the same API as the web dashboard.
 
 ## Requirements
 
@@ -17,6 +20,7 @@ uv sync --locked
 
 uv installs Python 3.15.0 from [.python-version](.python-version) and creates a local virtual environment.
 The project requires Python 3.15 or newer. ruamel.yaml writes the YAML files and their date comments.
+NetworkX matches distinct meals to available slots.
 Ruff, ty, PyYAML, and the PyYAML type stubs are development dependencies. [uv.lock](uv.lock) pins the dependency versions.
 
 ## Sign In
@@ -42,22 +46,32 @@ To export the current week and next week, run:
 uv run calori.py fetch
 ```
 
-On October 10, 2026, this command writes:
+On October 13, 2026, `tree --dirsfirst data` shows:
 
 ```text
-data/2026/week41.yaml
-data/2026/week42.yaml
+data
+├── 2026
+│   ├── week41.yaml
+│   ├── week42.yaml
+│   ├── week43-meals.yaml
+│   └── week43.yaml
+└── stats.yaml
+
+2 directories, 5 files
 ```
+
+The directory includes selected-meal exports from earlier weeks.
 
 The default week starts on Monday in the Europe/Helsinki time zone.
 Each filename uses the Monday's ISO week number and ISO year. Week numbers have two digits.
 For example, Monday December 30, 2019 belongs to ISO week 01 of 2020.
-A complete four-meal, seven-day plan contains 28 meals per file.
+A complete four-meal, seven-day plan contains 28 selected meals per week.
+Each companion file lists the available meals, with the rarest meals first.
 
 For one specific week, run:
 
 ```sh
-uv run calori.py fetch --week 2026-10-05 --weeks 1
+uv run calori.py fetch --week 2026-10-19 --weeks 1
 ```
 
 For a different output directory, run:
@@ -67,13 +81,56 @@ uv run calori.py fetch --output-dir exports
 ```
 
 The command sends errors and file summaries to stderr. It does not write meal data to stdout.
-It fetches and serializes all requested weeks before it writes files.
+It fetches and serializes all requested weeks before it writes weekly files.
+It then rebuilds the meal statistics from the stored weekly files.
 Each file replacement is atomic. Files for other weeks remain unchanged.
 A file-system error can leave some weeks updated and others unchanged. A failed command returns a nonzero exit code.
 
-## YAML Format
+## Select Uneaten Meals
 
-Each file maps `mon` through `sun` to lists of selected meals, in weekday and meal-slot order.
+To preview a plan for the latest exported week, run:
+
+```sh
+uv run calori.py select
+```
+
+The preview shows the proposed meal names and slots as YAML on stdout.
+It does not change your selections or meal exports.
+
+To save the plan to Calori, run:
+
+```sh
+uv run calori.py select --apply
+```
+
+The `--apply` option changes your selections on Calori. Each run builds a fresh plan from the live API menu.
+The command uses the same historical selections as the meal statistics, with the newest stored week excluded.
+It reads those weekly exports directly, so a stale statistics file does not affect the plan.
+Only meals absent from that history qualify as uneaten.
+
+Every existing slot receives a different meal name. The command preserves each slot's meal size and does not add slots.
+Defaults remain eligible, regardless of the website chooser filters.
+If no full plan exists, the command stops without changes. It does not repeat meals or use previously eaten meals as substitutes.
+Closed weeks and weeks in the past cause an error.
+
+Before the first update, the command compares your live selections with the original plan data.
+Each update also requires the previous meal to remain unchanged in that slot.
+After a successful save, the command refreshes that week's selected meals, availability, and meal statistics.
+Calori saves one slot per request. A failed request can leave some changes saved.
+
+If the command reports a partial failure, run the fetch command before you try again.
+
+For a different export directory, run:
+
+```sh
+uv run calori.py select --output-dir exports
+```
+
+## YAML Formats
+
+### Selected Meals
+
+Each `weekNN.yaml` file maps `mon` through `sun` to lists of selected meals, in weekday and meal-slot order.
 Each weekday key has its actual date as an inline comment, for example `mon: # 2026-10-05`.
 Empty days also have a date comment, for example `mon: [] # 2026-10-05`.
 Meal entries omit `date` and `day_of_week`.
@@ -93,6 +150,56 @@ The selected-meal macros remain unchanged.
 The command selects the newest subscription with an active, trialing, or past-due status, as the dashboard does.
 Days without selected meals contain empty lists. All seven weekday keys remain present, including in empty weeks.
 Missing menu weeks cause an error.
+
+### Meal Opportunities
+
+Each `weekNN-meals.yaml` file lists the weekly API menu, including default meals and alternatives.
+The exporter does not apply the website chooser filters. The counts do not depend on your current selections.
+The file describes menu availability, not whether Calori still accepts changes for that week.
+
+Example structure:
+
+```yaml
+meals:
+	- name: Apple Delight
+		opportunities: 1
+		spots:
+			- mon/breakfast
+```
+
+Each meal contains these keys in order:
+
+- `name`: The meal name
+- `opportunities`: The number of distinct day/meal-slot pairs
+- `spots`: The day/meal-slot pairs where the meal is available
+
+The exporter combines templates with identical names. Duplicate slots count once.
+Meals with fewer opportunities appear first. Equal counts use alphabetical names without case differences.
+Spots follow weekday order, then breakfast, lunch, dinner, and snack.
+A week with no available meals contains `meals: []`.
+
+### Meal Statistics
+
+Each fetch rebuilds `stats.yaml` in the output directory from all stored `YEAR/weekNN.yaml` files.
+The statistics exclude the newest stored ISO week, across all year directories.
+With week 43 as the newest export, the current statistics include weeks 41 and 42.
+Availability files do not contribute to the counts.
+
+Example structure:
+
+```yaml
+- meals:
+	- name: Apple Delight
+		eaten: 2
+```
+
+The `eaten` value counts each selected meal once, including repeated meals on the same day.
+These counts come from selected meals, not a consumption log.
+Meal names use alphabetical order without case differences. Each fetch replaces the previous counts, so repeat runs do not increase them.
+With fewer than two stored weeks, the file contains `- meals: []`.
+
+If a historical export is invalid, the command leaves the previous statistics unchanged and returns an error.
+The weekly files can already contain updated data at that point.
 
 ## Local Data
 

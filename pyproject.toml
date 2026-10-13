@@ -1,10 +1,10 @@
 [project]
 name = "calori-data-fetcher"
-version = "0.1.0"
+version = "0.2.0"
 description = "Export selected Calori meals as weekly YAML files."
 readme = "README.md"
 requires-python = ">=3.15"
-dependencies = ["ruamel-yaml"]
+dependencies = ["networkx", "ruamel-yaml"]
 
 [dependency-groups]
 dev = ["pyyaml", "ruff", "ty", "types-pyyaml"]

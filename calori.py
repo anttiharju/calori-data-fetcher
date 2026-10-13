@@ -13,12 +13,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import Counter
 from html.parser import HTMLParser
 from io import StringIO
 from pathlib import Path
 from typing import TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import networkx as nx
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.error import YAMLError
@@ -35,6 +37,7 @@ SELECTION_FIELDS = (
 )
 DAY_OFFSETS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 MEAL_ORDER = {"breakfast": 0, "lunch": 1, "dinner": 2, "snack": 3}
+MENU_PAGE_SIZE = 500
 
 
 class ExportedMeal(TypedDict):
@@ -44,6 +47,27 @@ class ExportedMeal(TypedDict):
     name: str | None
     image_url: str | None
     macros: dict[str, float | None]
+
+
+class MealOpportunity(TypedDict):
+    name: str
+    opportunities: int
+    spots: list[str]
+
+
+class PlannedSelection(TypedDict):
+    slot: tuple[str, str]
+    id: str
+    previous_meal_id: str
+    meal_id: str
+    name: str
+
+
+class SelectionPlan(TypedDict):
+    monday: dt.date
+    week_id: str
+    subscription_id: str
+    meals: list[PlannedSelection]
 
 
 class CaloriError(Exception):
@@ -61,7 +85,7 @@ class NoRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def request_json(path, api_key, access_token=None, params=None, body=None):
+def request_json(path, api_key, access_token=None, params=None, body=None, *, method=None):
     url = API_URL + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -72,7 +96,9 @@ def request_json(path, api_key, access_token=None, params=None, body=None):
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
+    if method == "PATCH":
+        headers["Prefer"] = "return=representation"
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.build_opener(NoRedirects).open(request, timeout=30) as response:
             return json.load(response)
@@ -159,11 +185,7 @@ def write_json(path, value):
     write_text(path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
 
-def dump_week(days, monday: dt.date) -> str:
-    document = CommentedMap(days)
-    for day, offset in DAY_OFFSETS.items():
-        date = (monday + dt.timedelta(days=offset)).isoformat()
-        document.yaml_add_eol_comment(date, key=day, column=5)
+def dump_yaml(document) -> str:
     serializer = YAML()
     serializer.allow_unicode = True
     serializer.default_flow_style = False
@@ -172,11 +194,20 @@ def dump_week(days, monday: dt.date) -> str:
         return output.getvalue()
 
 
+def dump_week(days, monday: dt.date) -> str:
+    document = CommentedMap(days)
+    for day, offset in DAY_OFFSETS.items():
+        date = (monday + dt.timedelta(days=offset)).isoformat()
+        document.yaml_add_eol_comment(date, key=day, column=5)
+    return dump_yaml(document)
+
+
 def write_weekly_meals(
     meals: list[ExportedMeal],
     starting_date: dt.date,
     week_count: int,
     output_dir: Path,
+    opportunities_by_week: dict[dt.date, list[MealOpportunity]] | None = None,
 ) -> dict[Path, int]:
     weeks: dict[dt.date, list[ExportedMeal]] = {
         starting_date + dt.timedelta(weeks=offset): [] for offset in range(week_count)
@@ -204,10 +235,54 @@ def write_weekly_meals(
             )
         text = dump_week(days, monday)
         exports.append((path, len(week_meals), text))
+        if opportunities_by_week is not None:
+            opportunities = opportunities_by_week[monday]
+            menu_path = path.with_stem(path.stem + "-meals")
+            exports.append((menu_path, len(opportunities), dump_yaml({"meals": opportunities})))
 
     for path, _count, text in exports:
         write_text(path, text)
     return {path: count for path, count, _text in exports}
+
+
+def exported_weeks(output_dir: Path) -> list[tuple[dt.date, Path]]:
+    weeks = []
+    for path in output_dir.glob("[0-9][0-9][0-9][0-9]/week[0-9][0-9].yaml"):
+        try:
+            monday = dt.date.fromisocalendar(int(path.parent.name), int(path.stem[4:]), 1)
+        except ValueError:
+            raise CaloriError(f"Invalid ISO week in {path}.") from None
+        weeks.append((monday, path))
+    return sorted(weeks)
+
+
+def count_selected_meals(weeks: list[tuple[dt.date, Path]]) -> Counter[str]:
+    counts: Counter[str] = Counter()
+    reader = YAML(typ="safe")
+    for _monday, path in weeks:
+        days = reader.load(path.read_text(encoding="utf-8"))
+        if not isinstance(days, dict) or set(days) != set(DAY_OFFSETS):
+            raise CaloriError(f"Invalid weekly export: {path}.")
+        for day_meals in days.values():
+            if not isinstance(day_meals, list):
+                raise CaloriError(f"Invalid meal list in {path}.")
+            for meal in day_meals:
+                name = meal.get("meal") if isinstance(meal, dict) else None
+                if not isinstance(name, str) or not name.strip():
+                    raise CaloriError(f"Invalid meal name in {path}.")
+                counts[name] += 1
+    return counts
+
+
+def write_meal_stats(output_dir: Path) -> dict[Path, int]:
+    counts = count_selected_meals(exported_weeks(output_dir)[:-1])
+    meals = [
+        {"name": name, "eaten": counts[name]}
+        for name in sorted(counts, key=lambda name: (name.casefold(), name))
+    ]
+    path = output_dir / "stats.yaml"
+    write_text(path, dump_yaml([{"meals": meals}]))
+    return {path: len(meals)}
 
 
 def save_session(path, api_key, tokens):
@@ -270,16 +345,36 @@ class CaloriClient:
             raise
         self.session = save_session(self.session_path, self.session["api_key"], tokens)
 
-    def get(self, path, params=None):
+    def request(self, path, params=None, *, body=None, method=None):
         if self.session["expires_at"] <= time.time() + 60:
             self.refresh()
         try:
-            return request_json(path, self.session["api_key"], self.session["access_token"], params)
+            return request_json(
+                path,
+                self.session["api_key"],
+                self.session["access_token"],
+                params,
+                body=body,
+                method=method,
+            )
         except APIError as error:
             if error.status != 401:
                 raise
         self.refresh()
-        return request_json(path, self.session["api_key"], self.session["access_token"], params)
+        return request_json(
+            path,
+            self.session["api_key"],
+            self.session["access_token"],
+            params,
+            body=body,
+            method=method,
+        )
+
+    def get(self, path, params=None):
+        return self.request(path, params)
+
+    def patch(self, path, body, params):
+        return self.request(path, params, body=body, method="PATCH")
 
 
 def single_relation(value, label):
@@ -319,9 +414,121 @@ def normalize_meals(rows, starting_date: dt.date) -> list[ExportedMeal]:
     return sorted(result, key=lambda meal: (meal["date"], MEAL_ORDER[meal["meal_time"]]))
 
 
-def export_meals(client, starting_date, week_count):
+def rank_meal_opportunities(rows, templates) -> list[MealOpportunity]:
+    names = {template["id"]: template.get("name") for template in templates}
+    spots_by_name: dict[str, set[tuple[str, str]]] = {}
+    for row in rows:
+        day = row.get("day_of_week")
+        meal_time = row.get("meal_time")
+        if day not in DAY_OFFSETS or meal_time not in MEAL_ORDER:
+            raise CaloriError("The API returned an unknown day or meal slot.")
+        name = names.get(row.get("generic_id"))
+        if not isinstance(name, str) or not name.strip():
+            raise CaloriError("The API returned a missing or unnamed meal template.")
+        spots_by_name.setdefault(name, set()).add((day, meal_time))
+
+    result: list[MealOpportunity] = []
+    for name, spots in spots_by_name.items():
+        ordered_spots = sorted(spots, key=lambda spot: (DAY_OFFSETS[spot[0]], MEAL_ORDER[spot[1]]))
+        result.append(
+            {
+                "name": name,
+                "opportunities": len(spots),
+                "spots": [f"{day}/{meal_time}" for day, meal_time in ordered_spots],
+            }
+        )
+    return sorted(
+        result, key=lambda meal: (meal["opportunities"], meal["name"].casefold(), meal["name"])
+    )
+
+
+def plan_unique_meals(
+    opportunities: list[MealOpportunity],
+    eaten: set[str],
+    slots: list[tuple[str, str]],
+) -> dict[tuple[str, str], str]:
+    if not slots or len(slots) != len(set(slots)):
+        raise CaloriError("The week has missing or duplicate meal slots.")
+    if any(day not in DAY_OFFSETS or meal_time not in MEAL_ORDER for day, meal_time in slots):
+        raise CaloriError("The API returned an unknown day or meal slot.")
+    ordered_slots = sorted(slots, key=lambda slot: (DAY_OFFSETS[slot[0]], MEAL_ORDER[slot[1]]))
+    available = {meal["name"]: meal for meal in opportunities if meal["name"] not in eaten}
+    names = sorted(
+        available,
+        key=lambda name: (available[name]["opportunities"], name.casefold(), name),
+    )
+    slot_nodes = {slot: index for index, slot in enumerate(ordered_slots)}
+    graph = nx.Graph()
+    graph.add_nodes_from(slot_nodes.values(), bipartite=0)
+    for index, name in enumerate(names, start=len(ordered_slots)):
+        for spot in available[name]["spots"]:
+            day, _separator, meal_time = spot.partition("/")
+            slot = (day, meal_time)
+            if slot in slot_nodes:
+                graph.add_edge(slot_nodes[slot], index)
+    matches = nx.algorithms.bipartite.maximum_matching(graph, top_nodes=slot_nodes.values())
+    plan = {
+        slot: names[matches[node] - len(ordered_slots)]
+        for slot, node in slot_nodes.items()
+        if node in matches
+    }
+    if len(plan) != len(slots):
+        raise CaloriError(
+            "No complete plan exists with uneaten, unique meals. "
+            f"Only {len(plan)} of {len(slots)} slots can be filled."
+        )
+    return plan
+
+
+def get_week_id(client, monday, *, require_open=False):
+    records = client.get(
+        "/rest/v1/weeks",
+        {"select": "id,starting_date,is_closed", "starting_date": "eq." + monday.isoformat()},
+    )
+    if not isinstance(records, list) or len(records) != 1:
+        raise CaloriError(f"No unique menu exists for the week of {monday}.")
+    if require_open and records[0].get("is_closed") is not False:
+        raise CaloriError(f"The week of {monday} is closed for selections.")
+    return records[0]["id"]
+
+
+def get_menu_rows(client, path, params):
+    rows = []
+    while True:
+        page = client.get(
+            path,
+            {
+                **params,
+                "order": "id",
+                "limit": str(MENU_PAGE_SIZE),
+                "offset": str(len(rows)),
+            },
+        )
+        if not isinstance(page, list):
+            raise CaloriError("The API did not return a list of menu rows.")
+        rows.extend(page)
+        if len(page) < MENU_PAGE_SIZE:
+            return rows
+
+
+def export_meal_opportunities(client, starting_date, week_count):
     if starting_date.weekday() != 0 or week_count < 1:
         raise CaloriError("Use a Monday and at least one week.")
+    templates = get_menu_rows(client, "/rest/v1/meal_templates", {"select": "id,name"})
+    result = {}
+    for offset in range(week_count):
+        monday = starting_date + dt.timedelta(weeks=offset)
+        week_id = get_week_id(client, monday)
+        rows = get_menu_rows(
+            client,
+            "/rest/v1/consumption_slots_mixed",
+            {"select": "day_of_week,meal_time,generic_id", "week_id": "eq." + week_id},
+        )
+        result[monday] = rank_meal_opportunities(rows, templates)
+    return result
+
+
+def get_subscription_id(client):
     user = client.get("/auth/v1/user")
     if not isinstance(user, dict) or not user.get("id"):
         raise CaloriError("The API did not return an authenticated user.")
@@ -337,32 +544,168 @@ def export_meals(client, starting_date, week_count):
     )
     if not subscriptions:
         raise CaloriError("No active subscription exists for this account.")
-    subscription_id = subscriptions[0]["id"]
+    return subscriptions[0]["id"]
+
+
+def get_selections(client, subscription_id, week_id, fields=SELECTION_FIELDS):
+    rows = client.get(
+        "/rest/v1/sub_meal_selections",
+        {"select": fields, "sub_id": "eq." + subscription_id, "week_id": "eq." + week_id},
+    )
+    if not isinstance(rows, list):
+        raise CaloriError("The API did not return a list of meal selections.")
+    return rows
+
+
+def export_meals(client, starting_date, week_count):
+    if starting_date.weekday() != 0 or week_count < 1:
+        raise CaloriError("Use a Monday and at least one week.")
+    subscription_id = get_subscription_id(client)
     meals = []
     for offset in range(week_count):
         week_start = starting_date + dt.timedelta(weeks=offset)
-        records = client.get(
-            "/rest/v1/weeks",
-            {
-                "select": "id,starting_date",
-                "starting_date": "eq." + week_start.isoformat(),
-            },
-        )
-        if not isinstance(records, list) or len(records) != 1:
-            raise CaloriError(f"No unique menu exists for the week of {week_start}.")
-        week_id = records[0]["id"]
-        rows = client.get(
-            "/rest/v1/sub_meal_selections",
-            {
-                "select": SELECTION_FIELDS,
-                "sub_id": "eq." + subscription_id,
-                "week_id": "eq." + week_id,
-            },
-        )
-        if not isinstance(rows, list):
-            raise CaloriError("The API did not return a list of meal selections.")
+        week_id = get_week_id(client, week_start)
+        rows = get_selections(client, subscription_id, week_id)
         meals.extend(normalize_meals(rows, week_start))
     return meals
+
+
+def selection_state(rows) -> dict[tuple[str, str], tuple[str, str]]:
+    state = {}
+    for row in rows:
+        slot = (row.get("day_of_week"), row.get("meal_time"))
+        if (
+            slot[0] not in DAY_OFFSETS
+            or slot[1] not in MEAL_ORDER
+            or not all(
+                isinstance(row.get(field), str) and row[field] for field in ("id", "meal_id")
+            )
+        ):
+            raise CaloriError("The API returned an invalid meal selection.")
+        if slot in state:
+            raise CaloriError("The API returned duplicate meal slots.")
+        state[slot] = (row["id"], row["meal_id"])
+    if not state:
+        raise CaloriError(
+            "The latest week has no selected meal slots. Run the fetch command again."
+        )
+    return state
+
+
+def prepare_selection_plan(client, output_dir: Path) -> SelectionPlan:
+    weeks = exported_weeks(output_dir)
+    if not weeks:
+        raise CaloriError("No exported weeks exist. Run: uv run calori.py fetch")
+    monday = weeks[-1][0]
+    if monday < current_monday():
+        raise CaloriError("The latest exported week is in the past. Run the fetch command again.")
+    eaten = set(count_selected_meals(weeks[:-1]))
+    week_id = get_week_id(client, monday, require_open=True)
+    subscription_id = get_subscription_id(client)
+    selections = get_selections(
+        client, subscription_id, week_id, "id,meal_id,day_of_week,meal_time"
+    )
+    state = selection_state(selections)
+    templates = get_menu_rows(
+        client, "/rest/v1/meal_templates", {"select": "id,name,small_id,large_id"}
+    )
+    by_id = {template["id"]: template for template in templates}
+    variants = {}
+    for field in ("small_id", "large_id"):
+        for template in templates:
+            if template.get(field):
+                variants[template[field]] = field
+    if any(meal_id not in variants for _selection_id, meal_id in state.values()):
+        raise CaloriError("Cannot determine the size of a current meal.")
+    rows = get_menu_rows(
+        client,
+        "/rest/v1/consumption_slots_mixed",
+        {"select": "day_of_week,meal_time,generic_id", "week_id": "eq." + week_id},
+    )
+    eligible = []
+    candidates: dict[tuple[tuple[str, str], str], str] = {}
+    for row in rows:
+        slot = (row.get("day_of_week"), row.get("meal_time"))
+        if slot not in state:
+            continue
+        template = by_id.get(row.get("generic_id"))
+        if template is None:
+            raise CaloriError("The API returned a missing meal template.")
+        name = template.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise CaloriError("The API returned a missing or unnamed meal template.")
+        meal_id = template.get(variants[state[slot][1]])
+        if isinstance(meal_id, str) and meal_id:
+            eligible.append(row)
+            candidates.setdefault((slot, name), meal_id)
+    names = plan_unique_meals(rank_meal_opportunities(eligible, templates), eaten, list(state))
+    return {
+        "monday": monday,
+        "week_id": week_id,
+        "subscription_id": subscription_id,
+        "meals": [
+            {
+                "slot": slot,
+                "id": state[slot][0],
+                "previous_meal_id": state[slot][1],
+                "meal_id": candidates[slot, name],
+                "name": name,
+            }
+            for slot, name in names.items()
+        ],
+    }
+
+
+def apply_selection_plan(client, plan: SelectionPlan) -> int:
+    if plan["monday"] < current_monday():
+        raise CaloriError("The planned week is in the past. Run the fetch command again.")
+    if get_week_id(client, plan["monday"], require_open=True) != plan["week_id"]:
+        raise CaloriError("The menu week changed. Run the fetch command again.")
+    fields = "id,meal_id,day_of_week,meal_time"
+    current = selection_state(
+        get_selections(client, plan["subscription_id"], plan["week_id"], fields)
+    )
+    expected = {meal["slot"]: (meal["id"], meal["previous_meal_id"]) for meal in plan["meals"]}
+    if current != expected:
+        raise CaloriError("Your selections changed during planning. Run the select command again.")
+
+    updated = 0
+    try:
+        for meal in plan["meals"]:
+            if meal["meal_id"] == meal["previous_meal_id"]:
+                continue
+            day, meal_time = meal["slot"]
+            saved = client.patch(
+                "/rest/v1/sub_meal_selections",
+                {
+                    "meal_id": meal["meal_id"],
+                    "is_initial": False,
+                    "created_at": dt.datetime.now(dt.UTC).isoformat(),
+                },
+                {
+                    "select": "id,meal_id",
+                    "id": "eq." + meal["id"],
+                    "sub_id": "eq." + plan["subscription_id"],
+                    "week_id": "eq." + plan["week_id"],
+                    "day_of_week": "eq." + day,
+                    "meal_time": "eq." + meal_time,
+                    "meal_id": "eq." + meal["previous_meal_id"],
+                },
+            )
+            if saved != [{"id": meal["id"], "meal_id": meal["meal_id"]}]:
+                raise CaloriError(f"Calori did not confirm the update for {day}/{meal_time}.")
+            updated += 1
+        saved_state = selection_state(
+            get_selections(client, plan["subscription_id"], plan["week_id"], fields)
+        )
+        if saved_state != {meal["slot"]: (meal["id"], meal["meal_id"]) for meal in plan["meals"]}:
+            raise CaloriError("The saved selections do not match the plan.")
+    except CaloriError as error:
+        raise CaloriError(
+            f"Selection stopped after {updated} confirmed updates. "
+            "Changes can already be saved. Run fetch before retrying. " + str(error)
+        ) from None
+    return updated
 
 
 def current_monday(now=None):
@@ -396,7 +739,9 @@ def positive_integer(value):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Export your Calori meals as weekly YAML files.")
+    parser = argparse.ArgumentParser(
+        description="Export Calori meals or select unique, uneaten meals."
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     login = commands.add_parser("login", help="Sign in and store a private local session.")
     login.add_argument(
@@ -415,7 +760,19 @@ def main(argv=None):
         "--output-dir",
         type=Path,
         default=Path("data"),
-        help="Directory for YEAR/weekNN.yaml files. Default: data.",
+        help="Directory for weekly YAML files and stats.yaml. Default: data.",
+    )
+    select = commands.add_parser(
+        "select", help="Preview unique, uneaten meals for the latest exported week."
+    )
+    select.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data"),
+        help="Directory with weekly exports and meal history. Default: data.",
+    )
+    select.add_argument(
+        "--apply", action="store_true", help="Save the plan to Calori. Default: preview only."
     )
     args = parser.parse_args(argv)
     try:
@@ -441,9 +798,39 @@ def main(argv=None):
                 file=sys.stderr,
             )
         else:
-            starting_date = args.week or current_monday()
-            meals = export_meals(CaloriClient(), starting_date, args.weeks)
-            exports = write_weekly_meals(meals, starting_date, args.weeks, args.output_dir)
+            client = CaloriClient()
+            if args.command == "select":
+                plan = prepare_selection_plan(client, args.output_dir)
+                print(
+                    dump_yaml(
+                        {
+                            "week": plan["monday"].isoformat(),
+                            "meals": [
+                                {"spot": "/".join(meal["slot"]), "name": meal["name"]}
+                                for meal in plan["meals"]
+                            ],
+                        }
+                    ),
+                    end="",
+                )
+                if not args.apply:
+                    print(
+                        "Preview only. No selections changed. Add --apply to save.", file=sys.stderr
+                    )
+                    return 0
+                updated = apply_selection_plan(client, plan)
+                starting_date = plan["monday"]
+                week_count = 1
+                print(f"Saved {updated} meal changes for {starting_date}.", file=sys.stderr)
+            else:
+                starting_date = args.week or current_monday()
+                week_count = args.weeks
+            meals = export_meals(client, starting_date, week_count)
+            opportunities = export_meal_opportunities(client, starting_date, week_count)
+            exports = write_weekly_meals(
+                meals, starting_date, week_count, args.output_dir, opportunities
+            )
+            exports.update(write_meal_stats(args.output_dir))
             for path, count in exports.items():
                 print(f"Exported {count} meals to {path}.", file=sys.stderr)
         return 0

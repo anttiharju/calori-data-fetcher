@@ -70,6 +70,19 @@ class FakeClient:
         self.calls = []
         self.subscriptions = [{"id": "test-subscription"}]
         self.weeks = True
+        self.week_closed = False
+        self.selections = None
+        self.patches = []
+        self.templates = [{"id": "test-template", "name": "Test meal"}]
+        self.availability = [
+            {
+                "day_of_week": row["day_of_week"],
+                "meal_time": row["meal_time"],
+                "generic_id": "test-template",
+                "is_default": False,
+            }
+            for row in meal_rows()
+        ]
 
     def get(self, path, params=None):
         self.calls.append((path, params))
@@ -79,10 +92,40 @@ class FakeClient:
             return self.subscriptions
         if path == "/rest/v1/weeks":
             assert params is not None
-            return [{"id": params["starting_date"][3:]}] if self.weeks else []
+            monday = params["starting_date"][3:]
+            return (
+                [{"id": monday, "starting_date": monday, "is_closed": self.week_closed}]
+                if self.weeks
+                else []
+            )
         if path == "/rest/v1/sub_meal_selections":
-            return meal_rows()
+            return meal_rows() if self.selections is None else copy.deepcopy(self.selections)
+        if path in ("/rest/v1/meal_templates", "/rest/v1/consumption_slots_mixed"):
+            assert params is not None
+            rows = self.templates if path.endswith("meal_templates") else self.availability
+            offset = int(params["offset"])
+            return rows[offset : offset + int(params["limit"])]
         raise AssertionError("Unexpected request: " + path)
+
+    def patch(self, path, body, params):
+        assert self.selections is not None
+        assert path == "/rest/v1/sub_meal_selections"
+        assert params["sub_id"] == "eq.test-subscription"
+        self.patches.append((path, copy.deepcopy(body), dict(params)))
+        for row in self.selections:
+            if all(
+                params[field] == "eq." + row[field]
+                for field in ("id", "week_id", "day_of_week", "meal_time", "meal_id")
+            ):
+                row.update(body)
+                template = next(
+                    template
+                    for template in self.templates
+                    if body["meal_id"] in (template.get("small_id"), template.get("large_id"))
+                )
+                row["meals"] = {"id": body["meal_id"], "meal_templates": template}
+                return [{"id": row["id"], "meal_id": row["meal_id"]}]
+        return []
 
 
 class ExportTests(unittest.TestCase):
@@ -181,6 +224,427 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(calori.normalize_meals([], self.monday), [])
         with mock.patch(__name__ + ".meal_rows", return_value=[]):
             self.assertEqual(calori.export_meals(self.client, self.monday, 2), [])
+
+
+class AvailabilityTests(unittest.TestCase):
+    def setUp(self):
+        self.client = FakeClient()
+        self.monday = dt.date(2026, 10, 5)
+
+    def test_counts_unique_spots_and_sorts_rarest_then_name_without_mutation(self):
+        templates = [
+            {"id": "apple", "name": "Apple Delight"},
+            {"id": "apple-variant", "name": "Apple Delight"},
+            {"id": "beef", "name": "Beef & Potatoes"},
+            {"id": "zucchini", "name": "Zucchini Pasta"},
+            {"id": "unused", "name": "Not on this menu"},
+        ]
+        rows = [
+            {"day_of_week": day, "meal_time": meal_time, "generic_id": template_id}
+            for day, meal_time, template_id in [
+                ("tue", "lunch", "beef"),
+                ("mon", "snack", "apple"),
+                ("thu", "lunch", "zucchini"),
+                ("mon", "breakfast", "apple"),
+                ("mon", "lunch", "beef"),
+                ("mon", "breakfast", "apple"),
+                ("mon", "breakfast", "apple-variant"),
+            ]
+        ]
+        original = copy.deepcopy((rows, templates))
+        self.assertEqual(
+            calori.rank_meal_opportunities(rows, templates),
+            [
+                {"name": "Zucchini Pasta", "opportunities": 1, "spots": ["thu/lunch"]},
+                {
+                    "name": "Apple Delight",
+                    "opportunities": 2,
+                    "spots": ["mon/breakfast", "mon/snack"],
+                },
+                {
+                    "name": "Beef & Potatoes",
+                    "opportunities": 2,
+                    "spots": ["mon/lunch", "tue/lunch"],
+                },
+            ],
+        )
+        self.assertEqual((rows, templates), original)
+
+    def test_empty_menu_has_no_opportunities(self):
+        self.assertEqual(calori.rank_meal_opportunities([], []), [])
+
+    def test_counts_defaults_and_alternatives_from_the_api_menu(self):
+        templates = [
+            {"id": "raspberry", "name": "Raspberry & Quark"},
+            {"id": "banana", "name": "Banana Quark"},
+        ]
+        rows = [
+            {
+                "day_of_week": day,
+                "meal_time": meal_time,
+                "generic_id": "raspberry",
+                "is_default": is_default,
+            }
+            for day, meal_time, is_default in [
+                ("mon", "breakfast", False),
+                ("tue", "breakfast", True),
+                ("tue", "snack", True),
+            ]
+        ]
+        self.assertEqual(
+            calori.rank_meal_opportunities(rows, templates),
+            [
+                {
+                    "name": "Raspberry & Quark",
+                    "opportunities": 3,
+                    "spots": ["mon/breakfast", "tue/breakfast", "tue/snack"],
+                },
+            ],
+        )
+
+    def test_rejects_unknown_slots_and_missing_template_names(self):
+        row = {"day_of_week": "mon", "meal_time": "breakfast", "generic_id": "apple"}
+        template = {"id": "apple", "name": "Apple Delight"}
+        for field in ["day_of_week", "meal_time"]:
+            with self.subTest(field=field), self.assertRaisesRegex(calori.CaloriError, "unknown"):
+                calori.rank_meal_opportunities([dict(row, **{field: "unknown"})], [template])
+        for templates in [[], [{"id": "apple"}], [{"id": "apple", "name": " "}]]:
+            with (
+                self.subTest(templates=templates),
+                self.assertRaisesRegex(calori.CaloriError, "meal template"),
+            ):
+                calori.rank_meal_opportunities([row], templates)
+
+    def test_fetches_all_pages_for_each_requested_week(self):
+        with mock.patch("calori.MENU_PAGE_SIZE", 2):
+            result = calori.export_meal_opportunities(self.client, self.monday, 2)
+        expected = calori.rank_meal_opportunities(self.client.availability, self.client.templates)
+        self.assertEqual(
+            result, {self.monday: expected, self.monday + dt.timedelta(weeks=1): expected}
+        )
+        self.assertEqual(result[self.monday][0]["opportunities"], 28)
+        queries = [
+            params for path, params in self.client.calls if path.endswith("consumption_slots_mixed")
+        ]
+        self.assertEqual(
+            [params["week_id"] for params in queries],
+            ["eq.2026-10-05"] * 15 + ["eq.2026-10-12"] * 15,
+        )
+        self.assertEqual(
+            [params["offset"] for params in queries[:15]], list(map(str, range(0, 29, 2)))
+        )
+        self.assertTrue(all(params["order"] == "id" for params in queries))
+        self.assertTrue(all("is_default" not in params for params in queries))
+
+    def test_keeps_opportunities_separate_between_weeks(self):
+        next_monday = self.monday + dt.timedelta(weeks=1)
+        get = self.client.get
+
+        def response(path, params=None):
+            assert params is not None
+            if path.endswith("consumption_slots_mixed") and params["week_id"] == "eq.2026-10-12":
+                return []
+            return get(path, params)
+
+        with mock.patch.object(self.client, "get", side_effect=response):
+            result = calori.export_meal_opportunities(self.client, self.monday, 2)
+        self.assertEqual(result[self.monday][0]["opportunities"], 28)
+        self.assertEqual(result[next_monday], [])
+
+    def test_fetch_keeps_defaults_without_using_current_selections(self):
+        self.client.templates.append({"id": "raspberry", "name": "Raspberry & Quark"})
+        self.client.availability = [
+            {
+                "day_of_week": "tue",
+                "meal_time": meal_time,
+                "generic_id": "raspberry",
+                "is_default": is_default,
+            }
+            for meal_time, is_default in [("breakfast", True), ("snack", False)]
+        ]
+        result = calori.export_meal_opportunities(self.client, self.monday, 1)[self.monday]
+        self.assertEqual(
+            result,
+            [
+                {
+                    "name": "Raspberry & Quark",
+                    "opportunities": 2,
+                    "spots": ["tue/breakfast", "tue/snack"],
+                }
+            ],
+        )
+        self.assertFalse(
+            any(path.endswith("sub_meal_selections") for path, _params in self.client.calls)
+        )
+
+    def test_rejects_invalid_ranges_missing_weeks_and_invalid_responses(self):
+        for day, count in [(dt.date(2026, 10, 6), 1), (self.monday, 0)]:
+            with self.subTest(day=day, count=count), self.assertRaises(calori.CaloriError):
+                calori.export_meal_opportunities(self.client, day, count)
+        self.client.weeks = False
+        with self.assertRaisesRegex(calori.CaloriError, "No unique menu"):
+            calori.export_meal_opportunities(self.client, self.monday, 1)
+        with (
+            mock.patch.object(self.client, "get", return_value={}),
+            self.assertRaisesRegex(calori.CaloriError, "list of menu rows"),
+        ):
+            calori.export_meal_opportunities(self.client, self.monday, 1)
+
+
+class PlanningTests(unittest.TestCase):
+    def setUp(self):
+        self.opportunities: list[calori.MealOpportunity] = [
+            {
+                "name": "Apple Delight",
+                "opportunities": 2,
+                "spots": ["mon/breakfast", "mon/snack"],
+            },
+            {
+                "name": "Banana Quark",
+                "opportunities": 2,
+                "spots": ["mon/breakfast", "tue/breakfast"],
+            },
+            {"name": "Previous meal", "opportunities": 1, "spots": ["mon/snack"]},
+        ]
+        self.slots = [("mon", "breakfast"), ("mon", "snack")]
+
+    def test_finds_a_complete_plan_without_repeats_or_previously_eaten_meals(self):
+        original = copy.deepcopy(self.opportunities)
+        plan = calori.plan_unique_meals(self.opportunities, {"Previous meal"}, self.slots)
+        self.assertEqual(
+            plan, {("mon", "breakfast"): "Banana Quark", ("mon", "snack"): "Apple Delight"}
+        )
+        self.assertEqual(self.opportunities, original)
+
+    def test_plan_does_not_depend_on_input_order(self):
+        expected = calori.plan_unique_meals(self.opportunities, set(), self.slots)
+        self.assertEqual(
+            calori.plan_unique_meals(
+                list(reversed(self.opportunities)), set(), list(reversed(self.slots))
+            ),
+            expected,
+        )
+
+    def test_fails_instead_of_reusing_a_meal_or_filling_an_unavailable_slot(self):
+        for eaten, slots in [
+            ({"Banana Quark", "Previous meal"}, self.slots),
+            (set(), self.slots + [("wed", "breakfast")]),
+        ]:
+            with (
+                self.subTest(eaten=eaten, slots=slots),
+                self.assertRaisesRegex(calori.CaloriError, "No complete plan"),
+            ):
+                calori.plan_unique_meals(self.opportunities, eaten, slots)
+
+    def test_rejects_empty_duplicate_and_unknown_slots(self):
+        for slots in [[], self.slots * 2, [("unknown", "breakfast")]]:
+            with self.subTest(slots=slots), self.assertRaises(calori.CaloriError):
+                calori.plan_unique_meals(self.opportunities, set(), slots)
+
+
+class SelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output_dir = Path(self.directory.name) / "data"
+        self.monday = dt.date(2026, 10, 19)
+        clock = mock.patch("calori.current_monday", return_value=dt.date(2026, 10, 12))
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.client = FakeClient()
+        self.client.templates = [
+            {"id": name, "name": name, "small_id": name + "-small", "large_id": name + "-large"}
+            for name in ["Apple Delight", "Banana Quark", "Previous meal", "Current meal"]
+        ]
+        self.client.availability = [
+            {"day_of_week": "mon", "meal_time": meal_time, "generic_id": name}
+            for name, meal_time in [
+                ("Apple Delight", "breakfast"),
+                ("Apple Delight", "snack"),
+                ("Banana Quark", "breakfast"),
+                ("Previous meal", "snack"),
+            ]
+        ]
+        self.selections = [
+            {
+                "id": "selection-" + meal_time,
+                "meal_id": "Current meal-" + size,
+                "day_of_week": "mon",
+                "meal_time": meal_time,
+                "week_id": "2026-10-19",
+                "meals": {"id": "Current meal-" + size, "meal_templates": {"name": "Current meal"}},
+            }
+            for meal_time, size in [("breakfast", "small"), ("snack", "large")]
+        ]
+        self.client.selections = self.selections
+        history = calori.normalize_meals(meal_rows()[:1], self.monday - dt.timedelta(weeks=1))
+        history[0]["name"] = "Previous meal"
+        calori.write_weekly_meals(history, self.monday - dt.timedelta(weeks=1), 2, self.output_dir)
+
+    def test_prepares_latest_week_from_live_menu_and_history_without_writes(self):
+        calori.write_text(self.output_dir / "stats.yaml", "not the source of history\n")
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(plan["monday"], self.monday)
+        self.assertEqual(plan["week_id"], "2026-10-19")
+        self.assertEqual(plan["subscription_id"], "test-subscription")
+        self.assertEqual(
+            [(meal["slot"], meal["name"], meal["meal_id"]) for meal in plan["meals"]],
+            [
+                (("mon", "breakfast"), "Banana Quark", "Banana Quark-small"),
+                (("mon", "snack"), "Apple Delight", "Apple Delight-large"),
+            ],
+        )
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_excludes_choices_without_the_required_meal_size(self):
+        del self.client.templates[1]["small_id"]
+        with self.assertRaisesRegex(calori.CaloriError, "No complete plan"):
+            calori.prepare_selection_plan(self.client, self.output_dir)
+
+    def test_rejects_closed_weeks_and_unknown_current_meal_sizes(self):
+        self.client.week_closed = True
+        with self.assertRaisesRegex(calori.CaloriError, "closed"):
+            calori.prepare_selection_plan(self.client, self.output_dir)
+        self.client.week_closed = False
+        self.selections[0]["meal_id"] = "unknown"
+        with self.assertRaisesRegex(calori.CaloriError, "size"):
+            calori.prepare_selection_plan(self.client, self.output_dir)
+
+    def test_rejects_missing_or_past_exports_before_network_access(self):
+        with self.assertRaisesRegex(calori.CaloriError, "No exported weeks"):
+            calori.prepare_selection_plan(self.client, self.output_dir / "missing")
+        with (
+            mock.patch("calori.current_monday", return_value=dt.date(2026, 10, 26)),
+            self.assertRaisesRegex(calori.CaloriError, "in the past"),
+        ):
+            calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(self.client.calls, [])
+
+    def test_rejects_missing_duplicate_or_invalid_selection_rows(self):
+        row = self.selections[0]
+        for rows in [[], [row, row], [dict(row, id=None)]]:
+            with self.subTest(rows=rows), self.assertRaises(calori.CaloriError):
+                calori.selection_state(rows)
+
+    def test_shared_variant_ids_follow_the_dashboard_large_convention(self):
+        self.client.templates[-1]["small_id"] = "Current meal-large"
+        for row in self.selections:
+            row["meal_id"] = "Current meal-large"
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertTrue(all(meal["meal_id"].endswith("-large") for meal in plan["meals"]))
+
+    def test_applies_a_scoped_plan_checks_saved_rows_and_skips_unchanged_meals(self):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(calori.apply_selection_plan(self.client, plan), 2)
+        self.assertEqual(len(self.client.patches), 2)
+        for meal, (path, body, params) in zip(plan["meals"], self.client.patches, strict=True):
+            self.assertEqual(path, "/rest/v1/sub_meal_selections")
+            self.assertEqual(body["meal_id"], meal["meal_id"])
+            self.assertFalse(body["is_initial"])
+            self.assertEqual(
+                dt.datetime.fromisoformat(body["created_at"]).utcoffset(), dt.timedelta()
+            )
+            self.assertEqual(
+                params,
+                {
+                    "select": "id,meal_id",
+                    "id": "eq." + meal["id"],
+                    "sub_id": "eq.test-subscription",
+                    "week_id": "eq.2026-10-19",
+                    "day_of_week": "eq.mon",
+                    "meal_time": "eq." + meal["slot"][1],
+                    "meal_id": "eq." + meal["previous_meal_id"],
+                },
+            )
+        second_plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        self.assertEqual(calori.apply_selection_plan(self.client, second_plan), 0)
+        self.assertEqual(len(self.client.patches), 2)
+
+    def test_changes_to_live_selections_or_week_status_prevent_all_writes(self):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        original = self.selections[0]["meal_id"]
+        self.selections[0]["meal_id"] = "a-new-selection"
+        with self.assertRaisesRegex(calori.CaloriError, "selections changed"):
+            calori.apply_selection_plan(self.client, plan)
+        self.selections[0]["meal_id"] = original
+        self.client.week_closed = True
+        with self.assertRaisesRegex(calori.CaloriError, "closed"):
+            calori.apply_selection_plan(self.client, plan)
+        self.assertEqual(self.client.patches, [])
+
+    def test_write_failure_stops_the_plan_and_reports_partial_progress(self):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        patch = self.client.patch
+
+        def fail_second_update(path, body, params):
+            if self.client.patches:
+                raise calori.APIError(409)
+            return patch(path, body, params)
+
+        with (
+            mock.patch.object(self.client, "patch", side_effect=fail_second_update),
+            self.assertRaisesRegex(calori.CaloriError, "after 1 confirmed updates"),
+        ):
+            calori.apply_selection_plan(self.client, plan)
+        self.assertEqual(len(self.client.patches), 1)
+
+    def test_unconfirmed_update_is_not_reported_as_successful(self):
+        plan = calori.prepare_selection_plan(self.client, self.output_dir)
+        with (
+            mock.patch.object(self.client, "patch", return_value=[]),
+            self.assertRaisesRegex(calori.CaloriError, "after 0 confirmed updates"),
+        ):
+            calori.apply_selection_plan(self.client, plan)
+
+    def test_select_command_previews_then_applies_and_refreshes_exports(self):
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        arguments = ["select", "--output-dir", str(self.output_dir)]
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(calori.main(arguments), 0)
+        preview = yaml.safe_load(output.getvalue())
+        self.assertEqual(preview["week"], "2026-10-19")
+        self.assertEqual(len(preview["meals"]), 2)
+        self.assertNotIn("test-subscription", output.getvalue())
+        self.assertIn("Preview only", errors.getvalue())
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(
+            {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}, originals
+        )
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(calori.main([*arguments, "--apply"]), 0)
+        self.assertIn("Saved 2 meal changes", errors.getvalue())
+        saved = yaml.safe_load((self.output_dir / "2026/week43.yaml").read_text())
+        self.assertEqual([meal["meal"] for meal in saved["mon"]], ["Banana Quark", "Apple Delight"])
+        self.assertEqual(
+            yaml.safe_load((self.output_dir / "stats.yaml").read_text()),
+            [{"meals": [{"name": "Previous meal", "eaten": 1}]}],
+        )
+
+    def test_impossible_plan_fails_before_changes_to_calori_or_local_files(self):
+        self.client.availability = self.client.availability[:2]
+        originals = {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}
+        with (
+            mock.patch("calori.CaloriClient", return_value=self.client),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(
+                calori.main(["select", "--apply", "--output-dir", str(self.output_dir)]), 1
+            )
+        self.assertIn("No complete plan", errors.getvalue())
+        self.assertEqual(self.client.patches, [])
+        self.assertEqual(
+            {path: path.read_bytes() for path in self.output_dir.rglob("*.yaml")}, originals
+        )
 
 
 class WeeklyExportTests(unittest.TestCase):
@@ -329,6 +793,159 @@ class WeeklyExportTests(unittest.TestCase):
         self.assertEqual(path.read_text(), "[]\n")
         self.assertEqual(list(path.parent.iterdir()), [path])
 
+    def test_companion_files_preserve_selected_exports_and_use_the_requested_schema(self):
+        exports = calori.write_weekly_meals(self.meals, self.monday, 2, self.output_dir)
+        originals = {path: path.read_bytes() for path in exports}
+        opportunities = calori.export_meal_opportunities(FakeClient(), self.monday, 2)
+        opportunities[self.monday][0]["name"] = "Cr\u00e8me: oats & fruit"
+        opportunities[self.monday + dt.timedelta(weeks=1)] = []
+        exports = calori.write_weekly_meals(
+            self.meals, self.monday, 2, self.output_dir, opportunities
+        )
+        self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+        for offset, week in enumerate([41, 42]):
+            path = self.output_dir / "2026" / f"week{week}-meals.yaml"
+            monday = self.monday + dt.timedelta(weeks=offset)
+            document = yaml.safe_load(path.read_text())
+            self.assertEqual(document, {"meals": opportunities[monday]})
+            self.assertEqual(exports[path], len(opportunities[monday]))
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            for meal in document["meals"]:
+                self.assertEqual(list(meal), ["name", "opportunities", "spots"])
+                self.assertEqual(meal["opportunities"], len(meal["spots"]))
+
+    def test_companion_files_use_iso_years_at_the_year_boundary(self):
+        monday = dt.date(2020, 12, 28)
+        opportunities = calori.export_meal_opportunities(FakeClient(), monday, 2)
+        exports = calori.write_weekly_meals([], monday, 2, self.output_dir, opportunities)
+        self.assertEqual(
+            set(exports),
+            {
+                self.output_dir / "2020/week53.yaml",
+                self.output_dir / "2020/week53-meals.yaml",
+                self.output_dir / "2021/week01.yaml",
+                self.output_dir / "2021/week01-meals.yaml",
+            },
+        )
+
+    def test_companion_serialization_failure_preserves_all_existing_exports(self):
+        opportunities = calori.export_meal_opportunities(FakeClient(), self.monday, 2)
+        exports = calori.write_weekly_meals(
+            self.meals, self.monday, 2, self.output_dir, opportunities
+        )
+        originals = {path: path.read_bytes() for path in exports}
+        with (
+            mock.patch(
+                "calori.dump_yaml",
+                side_effect=[
+                    "mon: []\n",
+                    "meals: []\n",
+                    "mon: []\n",
+                    calori.YAMLError("Invalid YAML"),
+                ],
+            ),
+            self.assertRaises(calori.YAMLError),
+        ):
+            calori.write_weekly_meals(self.meals, self.monday, 2, self.output_dir, opportunities)
+        self.assertEqual({path: path.read_bytes() for path in exports}, originals)
+
+
+class StatsTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.output_dir = Path(self.directory.name) / "data"
+        self.path = self.output_dir / "stats.yaml"
+
+    def write_week(self, monday, names):
+        iso_week = monday.isocalendar()
+        path = self.output_dir / str(iso_week.year) / f"week{iso_week.week:02d}.yaml"
+        days = {day: [] for day in calori.DAY_OFFSETS}
+        days["mon"] = [{"meal": name} for name in names]
+        calori.write_text(path, calori.dump_week(days, monday))
+        return path
+
+    def test_counts_stored_selections_and_excludes_newest_week_and_availability(self):
+        paths = [
+            self.write_week(
+                dt.date(2026, 10, 5), ["Banana Quark", "Apple Delight", "Apple Delight"]
+            ),
+            self.write_week(
+                dt.date(2026, 10, 12), ["Banana Quark", "Banana Quark", "Cr\u00e8me: oats"]
+            ),
+            self.write_week(dt.date(2026, 10, 19), ["Apple Delight", "Future meal"]),
+        ]
+        originals = {path: path.read_bytes() for path in paths}
+        calori.write_text(self.output_dir / "2026/week44-meals.yaml", "meals: []\n")
+        self.assertEqual(calori.write_meal_stats(self.output_dir), {self.path: 3})
+        self.assertEqual(
+            yaml.safe_load(self.path.read_text()),
+            [
+                {
+                    "meals": [
+                        {"name": "Apple Delight", "eaten": 2},
+                        {"name": "Banana Quark", "eaten": 3},
+                        {"name": "Cr\u00e8me: oats", "eaten": 1},
+                    ]
+                }
+            ],
+        )
+        self.assertEqual({path: path.read_bytes() for path in paths}, originals)
+        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o600)
+
+    def test_empty_history_and_single_week_produce_empty_stats(self):
+        for names in [None, ["Apple Delight"]]:
+            with self.subTest(names=names):
+                if names is not None:
+                    self.write_week(dt.date(2026, 10, 19), names)
+                self.assertEqual(calori.write_meal_stats(self.output_dir), {self.path: 0})
+                self.assertEqual(yaml.safe_load(self.path.read_text()), [{"meals": []}])
+
+    def test_newest_week_uses_the_iso_year_not_only_the_week_number(self):
+        self.write_week(dt.date(2020, 12, 28), ["Apple Delight", "Apple Delight"])
+        self.write_week(dt.date(2021, 1, 4), ["Future meal"])
+        calori.write_meal_stats(self.output_dir)
+        self.assertEqual(
+            yaml.safe_load(self.path.read_text()),
+            [{"meals": [{"name": "Apple Delight", "eaten": 2}]}],
+        )
+
+    def test_rebuilds_counts_without_double_counting_and_advances_the_excluded_week(self):
+        self.write_week(dt.date(2026, 10, 5), ["Apple Delight"])
+        self.write_week(dt.date(2026, 10, 12), ["Banana Quark"])
+        calori.write_meal_stats(self.output_dir)
+        original = self.path.read_bytes()
+        calori.write_meal_stats(self.output_dir)
+        self.assertEqual(self.path.read_bytes(), original)
+        self.write_week(dt.date(2026, 10, 5), ["Apple Delight", "Apple Delight"])
+        self.write_week(dt.date(2026, 10, 19), ["Future meal"])
+        calori.write_meal_stats(self.output_dir)
+        self.assertEqual(
+            yaml.safe_load(self.path.read_text()),
+            [
+                {
+                    "meals": [
+                        {"name": "Apple Delight", "eaten": 2},
+                        {"name": "Banana Quark", "eaten": 1},
+                    ]
+                }
+            ],
+        )
+
+    def test_invalid_history_preserves_existing_stats(self):
+        history = self.write_week(dt.date(2026, 10, 5), ["Apple Delight"])
+        self.write_week(dt.date(2026, 10, 19), ["Future meal"])
+        calori.write_meal_stats(self.output_dir)
+        original = self.path.read_bytes()
+        invalid_meal = {day: [] for day in calori.DAY_OFFSETS}
+        invalid_meal["mon"] = [{"meal": None}]
+        for document in [[], {}, dict.fromkeys(calori.DAY_OFFSETS), invalid_meal]:
+            with self.subTest(document=document):
+                calori.write_text(history, calori.dump_yaml(document))
+                with self.assertRaisesRegex(calori.CaloriError, "Invalid"):
+                    calori.write_meal_stats(self.output_dir)
+                self.assertEqual(self.path.read_bytes(), original)
+
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
@@ -392,6 +1009,24 @@ class SessionTests(unittest.TestCase):
             with self.assertRaises(calori.APIError):
                 client.get("/auth/v1/user")
             self.assertEqual(request.call_count, 3)
+
+    def test_patch_refreshes_authorization_and_retries_the_same_update_once(self):
+        self.save()
+        client = calori.CaloriClient(self.path)
+        body = {"meal_id": "new-meal", "is_initial": False}
+        params = {"id": "eq.selection"}
+        saved = [{"id": "selection", "meal_id": "new-meal"}]
+        with mock.patch(
+            "calori.request_json", side_effect=[calori.APIError(401), self.tokens, saved]
+        ) as request:
+            self.assertEqual(client.patch("/rest/v1/sub_meal_selections", body, params), saved)
+        for call in [request.call_args_list[0], request.call_args_list[2]]:
+            self.assertEqual(call.args[3], params)
+            self.assertEqual(call.kwargs, {"body": body, "method": "PATCH"})
+        with mock.patch("calori.request_json", side_effect=calori.APIError(403)) as request:
+            with self.assertRaises(calori.APIError):
+                client.patch("/rest/v1/sub_meal_selections", body, params)
+            self.assertEqual(request.call_count, 1)
 
     def test_revoked_refresh_requires_login_and_preserves_existing_file(self):
         self.tokens["expires_at"] = 0
@@ -460,6 +1095,25 @@ class ConfigurationTests(unittest.TestCase):
         self.assertIn("select=id%2Cname", request.full_url)
         build.assert_called_once_with(calori.NoRedirects)
 
+    def test_patch_requests_the_saved_row_and_sends_json(self):
+        opener = mock.Mock()
+        opener.open.return_value = io.BytesIO(b'[{"id":"selection","meal_id":"new-meal"}]')
+        body = {"meal_id": "new-meal", "is_initial": False}
+        with mock.patch("calori.urllib.request.build_opener", return_value=opener):
+            result = calori.request_json(
+                "/rest/v1/sub_meal_selections",
+                "test-key",
+                "test-token",
+                {"id": "eq.selection"},
+                body,
+                method="PATCH",
+            )
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_method(), "PATCH")
+        self.assertEqual(request.get_header("Prefer"), "return=representation")
+        self.assertEqual(json.loads(request.data), body)
+        self.assertEqual(result, [{"id": "selection", "meal_id": "new-meal"}])
+
     def test_http_errors_do_not_disclose_response_contents(self):
         body = io.BytesIO(b"private-token")
         error = urllib.error.HTTPError(calori.API_URL, 401, "private-response", Message(), body)
@@ -527,6 +1181,15 @@ class CommandTests(unittest.TestCase):
                 self.assertEqual(list(days), list(calori.DAY_OFFSETS))
                 self.assertEqual(sum(len(meals) for meals in days.values()), 28)
                 self.assertIn(filename, errors.getvalue())
+                menu_path = Path(filename).with_stem(Path(filename).stem + "-meals")
+                menu = yaml.safe_load(menu_path.read_text())
+                self.assertEqual(menu["meals"][0]["opportunities"], 28)
+                self.assertIn(str(menu_path), errors.getvalue())
+            self.assertEqual(
+                yaml.safe_load(Path("data/stats.yaml").read_text()),
+                [{"meals": [{"name": "Test meal", "eaten": 28}]}],
+            )
+            self.assertIn("data/stats.yaml", errors.getvalue())
             self.assertEqual(output.getvalue(), "")
 
     def test_custom_output_directory_contains_only_requested_week(self):
@@ -555,9 +1218,26 @@ class CommandTests(unittest.TestCase):
             days = yaml.safe_load(path.read_text())
             self.assertEqual(list(days), list(calori.DAY_OFFSETS))
             self.assertEqual(sum(len(meals) for meals in days.values()), 28)
-            self.assertEqual(list(output_dir.rglob("*.yaml")), [path])
+            menu_path = output_dir / "2026/week41-meals.yaml"
+            stats_path = output_dir / "stats.yaml"
+            self.assertEqual(set(output_dir.rglob("*.yaml")), {path, menu_path, stats_path})
+            self.assertEqual(yaml.safe_load(menu_path.read_text())["meals"][0]["opportunities"], 28)
+            self.assertEqual(yaml.safe_load(stats_path.read_text()), [{"meals": []}])
             self.assertEqual(output.getvalue(), "")
             self.assertIn("Exported 28 meals", errors.getvalue())
+
+    def test_invalid_menu_writes_no_files(self):
+        client = FakeClient()
+        client.templates = []
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            contextlib.chdir(directory),
+            mock.patch("calori.CaloriClient", return_value=client),
+            contextlib.redirect_stderr(io.StringIO()) as errors,
+        ):
+            self.assertEqual(calori.main(["fetch"]), 1)
+            self.assertFalse(Path("data").exists())
+        self.assertIn("meal template", errors.getvalue())
 
     def test_missing_login_writes_no_files(self):
         output = io.StringIO()
