@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
+from collections.abc import Iterable
 from decimal import Decimal
 from html.parser import HTMLParser
 from io import StringIO
@@ -25,6 +26,7 @@ import pulp
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.error import YAMLError
+from ruamel.yaml.scalarstring import DoubleQuotedScalarString
 
 DASHBOARD_URL = "https://www.calori.fi/en/dashboard"
 API_URL = "https://qnlcyahsjuladxeiehcq.supabase.co"
@@ -48,12 +50,6 @@ class ExportedMeal(TypedDict):
     name: str | None
     image_url: str | None
     macros: dict[str, float | None]
-
-
-class MealOpportunity(TypedDict):
-    name: str
-    opportunities: int
-    spots: list[str]
 
 
 class MealChoice(TypedDict):
@@ -215,7 +211,6 @@ def write_weekly_meals(
     starting_date: dt.date,
     week_count: int,
     output_dir: Path,
-    opportunities_by_week: dict[dt.date, list[MealOpportunity]] | None = None,
 ) -> dict[Path, int]:
     weeks: dict[dt.date, list[ExportedMeal]] = {
         starting_date + dt.timedelta(weeks=offset): [] for offset in range(week_count)
@@ -243,10 +238,6 @@ def write_weekly_meals(
             )
         text = dump_week(days, monday)
         exports.append((path, len(week_meals), text))
-        if opportunities_by_week is not None:
-            opportunities = opportunities_by_week[monday]
-            menu_path = path.with_stem(path.stem + "-meals")
-            exports.append((menu_path, len(opportunities), dump_yaml({"meals": opportunities})))
 
     for path, _count, text in exports:
         write_text(path, text)
@@ -282,14 +273,18 @@ def count_selected_meals(weeks: list[tuple[dt.date, Path]]) -> Counter[str]:
     return counts
 
 
-def write_meal_stats(output_dir: Path) -> dict[Path, int]:
-    counts = count_selected_meals(exported_weeks(output_dir)[:-1])
-    meals = [
-        {"name": name, "eaten": counts[name]}
-        for name in sorted(counts, key=lambda name: (name.casefold(), name))
-    ]
+def write_meal_stats(output_dir: Path, meal_names: Iterable[str] = ()) -> dict[Path, int]:
+    counts = count_selected_meals(exported_weeks(output_dir))
+    for name in meal_names:
+        if not isinstance(name, str) or not name.strip():
+            raise CaloriError("The meal catalog contains an invalid name.")
+        counts.setdefault(name, 0)
+    meals = {
+        DoubleQuotedScalarString(name): counts[name]
+        for name in sorted(counts, key=lambda name: (-counts[name], name.casefold(), name))
+    }
     path = output_dir / "stats.yaml"
-    write_text(path, dump_yaml([{"meals": meals}]))
+    write_text(path, dump_yaml(meals))
     return {path: len(meals)}
 
 
@@ -420,34 +415,6 @@ def normalize_meals(rows, starting_date: dt.date) -> list[ExportedMeal]:
             }
         )
     return sorted(result, key=lambda meal: (meal["date"], MEAL_ORDER[meal["meal_time"]]))
-
-
-def rank_meal_opportunities(rows, templates) -> list[MealOpportunity]:
-    names = {template["id"]: template.get("name") for template in templates}
-    spots_by_name: dict[str, set[tuple[str, str]]] = {}
-    for row in rows:
-        day = row.get("day_of_week")
-        meal_time = row.get("meal_time")
-        if day not in DAY_OFFSETS or meal_time not in MEAL_ORDER:
-            raise CaloriError("The API returned an unknown day or meal slot.")
-        name = names.get(row.get("generic_id"))
-        if not isinstance(name, str) or not name.strip():
-            raise CaloriError("The API returned a missing or unnamed meal template.")
-        spots_by_name.setdefault(name, set()).add((day, meal_time))
-
-    result: list[MealOpportunity] = []
-    for name, spots in spots_by_name.items():
-        ordered_spots = sorted(spots, key=lambda spot: (DAY_OFFSETS[spot[0]], MEAL_ORDER[spot[1]]))
-        result.append(
-            {
-                "name": name,
-                "opportunities": len(spots),
-                "spots": [f"{day}/{meal_time}" for day, meal_time in ordered_spots],
-            }
-        )
-    return sorted(
-        result, key=lambda meal: (meal["opportunities"], meal["name"].casefold(), meal["name"])
-    )
 
 
 def plan_calorie_meals(
@@ -581,21 +548,15 @@ def get_menu_rows(client, path, params):
             return rows
 
 
-def export_meal_opportunities(client, starting_date, week_count):
-    if starting_date.weekday() != 0 or week_count < 1:
-        raise CaloriError("Use a Monday and at least one week.")
+def get_meal_names(client) -> set[str]:
     templates = get_menu_rows(client, "/rest/v1/meal_templates", {"select": "id,name"})
-    result = {}
-    for offset in range(week_count):
-        monday = starting_date + dt.timedelta(weeks=offset)
-        week_id = get_week_id(client, monday)
-        rows = get_menu_rows(
-            client,
-            "/rest/v1/consumption_slots_mixed",
-            {"select": "day_of_week,meal_time,generic_id", "week_id": "eq." + week_id},
-        )
-        result[monday] = rank_meal_opportunities(rows, templates)
-    return result
+    names = set()
+    for template in templates:
+        name = template.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise CaloriError("The meal catalog contains an invalid name.")
+        names.add(name)
+    return names
 
 
 def get_subscription_id(client):
@@ -923,11 +884,9 @@ def main(argv=None):
                 starting_date = args.week or current_monday()
                 week_count = args.weeks
             meals = export_meals(client, starting_date, week_count)
-            opportunities = export_meal_opportunities(client, starting_date, week_count)
-            exports = write_weekly_meals(
-                meals, starting_date, week_count, args.output_dir, opportunities
-            )
-            exports.update(write_meal_stats(args.output_dir))
+            meal_names = get_meal_names(client)
+            exports = write_weekly_meals(meals, starting_date, week_count, args.output_dir)
+            exports.update(write_meal_stats(args.output_dir, meal_names))
             for path, count in exports.items():
                 print(f"Exported {count} meals to {path}.", file=sys.stderr)
         return 0

@@ -1,7 +1,7 @@
 # Calori Optimizer
 
-Export your selected Calori meals and available choices as weekly YAML files.
-The command also counts meals from earlier exports.
+Export your selected Calori meals as weekly YAML files.
+The statistics include every meal name from the Calori catalog, with counts from all stored weeks.
 The `select` command plans meals near a daily calorie target for the latest exported week.
 The command uses the same API as the web dashboard.
 
@@ -53,11 +53,10 @@ data
 ├── 2026
 │   ├── week41.yaml
 │   ├── week42.yaml
-│   ├── week43-meals.yaml
 │   └── week43.yaml
 └── stats.yaml
 
-2 directories, 5 files
+2 directories, 4 files
 ```
 
 The directory includes selected-meal exports from earlier weeks.
@@ -66,7 +65,6 @@ The default week starts on Monday in the Europe/Helsinki time zone.
 Each filename uses the Monday's ISO week number and ISO year. Week numbers have two digits.
 For example, Monday December 30, 2019 belongs to ISO week 01 of 2020.
 A complete four-meal, seven-day plan contains 28 selected meals per week.
-Each companion file lists the available meals, with the rarest meals first.
 
 For one specific week, run:
 
@@ -111,8 +109,8 @@ uv run calori.py select --apply
 ```
 
 The `--apply` option changes your selections on Calori. Each run builds a fresh plan from the live API menu.
-The command uses the same historical selections as the meal statistics, with the newest stored week excluded.
-It reads those weekly exports directly, so a stale statistics file does not affect the plan.
+The planner reads its preference history directly from earlier weekly exports.
+It excludes the target week that it replaces, although the statistics include that week.
 Previously eaten meals remain eligible.
 
 The planner uses PuLP 4 and HiGHS to optimize the whole week together.
@@ -135,7 +133,7 @@ Closed weeks and weeks in the past cause an error.
 
 Before the first update, the command compares your live selections with the original plan data.
 Each update also requires the previous meal to remain unchanged in that slot.
-After a successful save, the command refreshes that week's selected meals, availability, and meal statistics.
+After a successful save, the command refreshes that week's selected meals and the meal statistics.
 Calori saves one slot per request. A failed request can leave some changes saved.
 
 If the command reports a partial failure, run the fetch command before you try again.
@@ -171,52 +169,28 @@ The command selects the newest subscription with an active, trialing, or past-du
 Days without selected meals contain empty lists. All seven weekday keys remain present, including in empty weeks.
 Missing menu weeks cause an error.
 
-### Meal Opportunities
-
-Each `weekNN-meals.yaml` file lists the weekly API menu, including default meals and alternatives.
-The exporter does not apply the website chooser filters. The counts do not depend on your current selections.
-The file describes menu availability, not whether Calori still accepts changes for that week.
-
-Example structure:
-
-```yaml
-meals:
-  - name: Apple Delight
-    opportunities: 1
-    spots:
-      - mon/breakfast
-```
-
-Each meal contains these keys in order:
-
-- `name`: The meal name
-- `opportunities`: The number of distinct day/meal-slot pairs
-- `spots`: The day/meal-slot pairs where the meal is available
-
-The exporter combines templates with identical names. Duplicate slots count once.
-Meals with fewer opportunities appear first. Equal counts use alphabetical names without case differences.
-Spots follow weekday order, then breakfast, lunch, dinner, and snack.
-A week with no available meals contains `meals: []`.
-
 ### Meal Statistics
 
 Each fetch rebuilds `stats.yaml` in the output directory from all stored `YEAR/weekNN.yaml` files.
-The statistics exclude the newest stored ISO week, across all year directories.
-With week 43 as the newest export, the current statistics include weeks 41 and 42.
-Availability files do not contribute to the counts.
+The statistics include every stored week, including the newest week, across all year directories.
+The command includes every distinct name from the Calori meal catalog. Meals without stored selections have a count of zero.
+Historical meal names remain present even if the catalog no longer includes them.
 
 Example structure:
 
 ```yaml
-- meals:
-    - name: Apple Delight
-      eaten: 2
+"Apple Delight": 2
+"Uneaten meal": 0
 ```
 
-The `eaten` value counts each selected meal once, including repeated meals on the same day.
+Each top-level key is a double-quoted meal name. Its integer value counts each selected occurrence, including repeats on the same day.
 These counts come from selected meals, not a consumption log.
-Meal names use alphabetical order without case differences. Each fetch replaces the previous counts, so repeat runs do not increase them.
-With fewer than two stored weeks, the file contains `- meals: []`.
+
+Counts use descending order. Equal counts use alphabetical names without case differences.
+Each fetch replaces the previous counts, so repeat runs do not increase them.
+
+With no stored selections, every catalog meal has a count of zero. An empty history and empty catalog produce `{}`.
+Catalog membership does not guarantee availability for a particular week.
 
 If a historical export is invalid, the command leaves the previous statistics unchanged and returns an error.
 The weekly files can already contain updated data at that point.
